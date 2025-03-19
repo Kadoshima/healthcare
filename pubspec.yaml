@@ -1,0 +1,47 @@
+name: healthcare2
+description: "Walking rhythm guidance application"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.2.1 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  sensors_plus: ^6.0.0  # 加速度センサーデータの取得
+  sqflite: ^2.0.3      # ローカルデータベース
+  path_provider: ^2.0.11 # ファイルパス取得
+  permission_handler: ^10.0.0  # 権限管理
+  provider: ^6.0.3     # 状態管理
+  fl_chart: ^0.63.0    # グラフ描画
+  shared_preferences: ^2.0.15  # 設定保存
+  csv: ^5.0.1          # CSVエクスポート
+  wakelock_plus: ^1.1.4
+  intl: ^0.17.0        # 日付フォーマット
+  share_plus: ^7.0.0   # ファイル共有
+  path: ^1.8.0         # パス操作
+  http: ^0.13.5
+  crypto: ^3.0.2
+  audioplayers: ^5.2.0
+  just_audio: ^0.9.32
+  audio_session: ^0.1.13
+  flutter_dotenv: ^5.1.0
+
+  # The following adds the Cupertino Icons font to your application.
+  # Use with the CupertinoIcons class for iOS style icons.
+  cupertino_icons: ^1.0.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+# flutter:
+#   uses-material-design: true
+#   assets:
+#     - assets/audio/
+
+flutter:
+  assets:
+    - .env
