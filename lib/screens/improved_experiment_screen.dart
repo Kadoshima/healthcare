@@ -6,26 +6,29 @@ import 'package:fl_chart/fl_chart.dart';
 import '../models/experiment_settings.dart';
 import '../models/gait_data.dart';
 import '../services/sensor_service.dart';
-// 以下のAudioServiceを使用する代わりに
-// import '../services/audio_service.dart';
-// ImprovedAudioServiceをインポート
 import '../services/improved_audio_service.dart';
 import '../services/experiment_service.dart';
 import '../widgets/phase_timer.dart';
 import '../widgets/tempo_display.dart';
+import '../widgets/walking_rhythm_metrics.dart'; // 新しい精度メトリクス表示ウィジェット
+import 'calibration_screen.dart'; // キャリブレーション画面
 import 'results_screen.dart';
 
-class ExperimentScreen extends StatefulWidget {
-  const ExperimentScreen({Key? key}) : super(key: key);
+/// 改良版実験画面
+///
+/// 歩行リズム測定精度に関する情報を提供し、
+/// キャリブレーション機能を統合
+class ImprovedExperimentScreen extends StatefulWidget {
+  const ImprovedExperimentScreen({Key? key}) : super(key: key);
 
   @override
-  State<ExperimentScreen> createState() => _ExperimentScreenState();
+  State<ImprovedExperimentScreen> createState() =>
+      _ImprovedExperimentScreenState();
 }
 
-class _ExperimentScreenState extends State<ExperimentScreen> {
+class _ImprovedExperimentScreenState extends State<ImprovedExperimentScreen> {
   // サービス
   late SensorService _sensorService;
-  // AudioServiceの代わりにImprovedAudioServiceを使用
   late ImprovedAudioService _audioService;
   late ExperimentService _experimentService;
 
@@ -39,6 +42,12 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
   final List<FlSpot> _rhythmDataPoints = [];
   final int _maxDataPoints = 100; // グラフ表示用のデータポイント数
 
+  // 精度検証関連
+  Timer? _verificationTimer;
+  bool _isVerifying = false;
+  int _verificationCount = 0;
+  final int _maxVerifications = 3;
+
   // セッションID
   int? _sessionId;
 
@@ -48,7 +57,6 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
 
     // サービスの取得
     _sensorService = Provider.of<SensorService>(context, listen: false);
-    // AudioServiceの代わりにImprovedAudioServiceを取得
     _audioService = Provider.of<ImprovedAudioService>(context, listen: false);
     _experimentService = Provider.of<ExperimentService>(context, listen: false);
 
@@ -107,6 +115,58 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
     // キャリブレーションから開始
     settings.startExperiment();
     _processPhaseChange(settings);
+
+    // 精度検証のスケジュール
+    _scheduleAccuracyVerification();
+  }
+
+  // 精度検証のスケジュール
+  void _scheduleAccuracyVerification() {
+    // 60秒ごとに精度検証を実行
+    _verificationTimer = Timer.periodic(const Duration(seconds: 60), (timer) {
+      // 精度検証回数の制限
+      if (_verificationCount >= _maxVerifications) {
+        timer.cancel();
+        return;
+      }
+
+      final settings = Provider.of<ExperimentSettings>(context, listen: false);
+
+      // 実験フェーズ中のみ検証
+      if (settings.currentPhase == ExperimentPhase.syncWithNaturalTempo ||
+          settings.currentPhase == ExperimentPhase.rhythmGuidance1 ||
+          settings.currentPhase == ExperimentPhase.rhythmGuidance2) {
+        // 精度検証実行
+        _verifyMeasurementAccuracy();
+        _verificationCount++;
+      }
+    });
+  }
+
+  // 測定精度の検証
+  void _verifyMeasurementAccuracy() {
+    final settings = Provider.of<ExperimentSettings>(context, listen: false);
+
+    // 既知のBPM（現在の目標テンポ）
+    final knownBpm = settings.getCurrentTempo();
+
+    if (knownBpm <= 0) return; // テンポが無効な場合
+
+    setState(() {
+      _isVerifying = true;
+    });
+
+    // センサー精度の検証
+    _sensorService.verifyAccuracy(knownBpm);
+
+    // 検証状態の表示を3秒間表示
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _isVerifying = false;
+        });
+      }
+    });
   }
 
   // フェーズ変更処理
@@ -141,7 +201,7 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
 
   // キャリブレーションフェーズ
   void _startCalibrationPhase(ExperimentSettings settings) {
-    _targetBpm = 100.0;
+    _targetBpm = 0.0;
     _audioService.stopTempoCues();
 
     // フェーズ開始
@@ -283,7 +343,39 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
     // フェーズタイマーのキャンセル
     _experimentService.cancelCurrentPhase();
 
+    // 検証タイマーのキャンセル
+    _verificationTimer?.cancel();
+
     super.dispose();
+  }
+
+  // キャリブレーション画面に遷移
+  void _navigateToCalibration() async {
+    final settings = Provider.of<ExperimentSettings>(context, listen: false);
+
+    // 現在のフェーズを一時保存
+    final currentPhase = settings.currentPhase;
+
+    // メトロノームを一時停止
+    final wasPlaying = _targetBpm > 0;
+    if (wasPlaying) {
+      _audioService.stopTempoCues();
+    }
+
+    // キャリブレーション画面に遷移
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => const CalibrationScreen(),
+      ),
+    );
+
+    // 戻ってきたらメトロノームを再開
+    if (wasPlaying && mounted) {
+      _audioService.startTempoCues(_targetBpm);
+    }
+
+    // 更新を反映させる
+    setState(() {});
   }
 
   // フェーズ表示部分の改善
@@ -420,6 +512,14 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
     );
   }
 
+  // 測定精度メトリクス表示
+  Widget _buildAccuracyMetrics() {
+    return WalkingRhythmMetrics(
+      showDetailed: true,
+      onCalibrateTap: _navigateToCalibration,
+    );
+  }
+
   // グラフ表示部分の改善
   Widget _buildRhythmGraph(
       List<FlSpot> dataPoints, double targetBpm, ExperimentSettings settings) {
@@ -473,6 +573,14 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
                   '歩行リズム推移',
                   style: Theme.of(context).textTheme.titleMedium,
                 ),
+                const Spacer(),
+                // 精度検証中の表示
+                if (_isVerifying)
+                  Chip(
+                    label: const Text('精度検証中'),
+                    avatar: const Icon(Icons.analytics, size: 16),
+                    backgroundColor: Colors.lightBlue.withOpacity(0.2),
+                  ),
               ],
             ),
             const SizedBox(height: 8),
@@ -614,6 +722,143 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
     );
   }
 
+  // 実験中止の確認ダイアログ
+  Future<void> _confirmAbortExperiment() async {
+    final shouldAbort = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('実験中止'),
+            content: const Text('実験を中止してもよろしいですか？\n\n中止した場合でもこれまでのデータは保存されます。'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('キャンセル'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('中止する'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (shouldAbort) {
+      // オーディオ停止
+      _audioService.stopTempoCues();
+
+      // センサー停止
+      _sensorService.stopSensing();
+
+      // 実験セッション完了
+      if (_sessionId != null) {
+        await _experimentService.completeExperimentSession();
+      }
+
+      // ホーム画面に戻る
+      if (!mounted) return;
+      Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = Provider.of<ExperimentSettings>(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('歩行リズム実験 (改良版)'),
+        centerTitle: true,
+        automaticallyImplyLeading: false,
+        actions: [
+          // キャリブレーションボタン
+          IconButton(
+            icon: const Icon(Icons.tune),
+            tooltip: 'センサーキャリブレーション',
+            onPressed: _navigateToCalibration,
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // フェーズ表示
+              _buildPhaseDisplay(settings),
+
+              const SizedBox(height: 16),
+
+              // 測定精度メトリクス
+              _buildAccuracyMetrics(),
+
+              const SizedBox(height: 16),
+
+              // リズム表示
+              _buildRhythmDisplay(_currentBpm, _targetBpm, settings),
+
+              const SizedBox(height: 16),
+
+              // グラフ表示
+              Expanded(
+                child:
+                    _buildRhythmGraph(_rhythmDataPoints, _targetBpm, settings),
+              ),
+
+              const SizedBox(height: 16),
+
+              // 実験中止ボタン
+              Align(
+                alignment: Alignment.center,
+                child: ElevatedButton.icon(
+                  icon: const Icon(Icons.stop),
+                  label: const Text('実験中止'),
+                  onPressed: _confirmAbortExperiment,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.red,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 24, vertical: 12),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // フェーズ表示テキスト
+  String _getPhaseDisplayText(ExperimentPhase phase) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return 'キャリブレーション';
+      case ExperimentPhase.silentWalking:
+        return '無音歩行';
+      case ExperimentPhase.syncWithNaturalTempo:
+        return '自然リズムと同期';
+      case ExperimentPhase.rhythmGuidance1:
+        return 'リズム誘導 1';
+      case ExperimentPhase.rhythmGuidance2:
+        return 'リズム誘導 2';
+      case ExperimentPhase.cooldown:
+        return 'クールダウン';
+      case ExperimentPhase.completed:
+        return '実験完了';
+      default:
+        return '準備中';
+    }
+  }
+
   // 各フェーズに対応するアイコンを取得
   IconData _getPhaseIcon(ExperimentPhase phase) {
     switch (phase) {
@@ -675,130 +920,6 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
         return '自然なリズムに戻ります。リラックスして歩いてください。';
       default:
         return '';
-    }
-  }
-
-  // 実験中止の確認ダイアログ
-  Future<void> _confirmAbortExperiment() async {
-    final shouldAbort = await showDialog<bool>(
-          context: context,
-          builder: (context) => AlertDialog(
-            title: const Text('実験中止'),
-            content: const Text('実験を中止してもよろしいですか？\n\n中止した場合でもこれまでのデータは保存されます。'),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(false),
-                child: const Text('キャンセル'),
-              ),
-              ElevatedButton(
-                onPressed: () => Navigator.of(context).pop(true),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red,
-                  foregroundColor: Colors.white,
-                ),
-                child: const Text('中止する'),
-              ),
-            ],
-          ),
-        ) ??
-        false;
-
-    if (shouldAbort) {
-      // オーディオ停止
-      _audioService.stopTempoCues();
-
-      // センサー停止
-      _sensorService.stopSensing();
-
-      // 実験セッション完了
-      if (_sessionId != null) {
-        await _experimentService.completeExperimentSession();
-      }
-
-      // ホーム画面に戻る
-      if (!mounted) return;
-      Navigator.of(context).pop();
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final settings = Provider.of<ExperimentSettings>(context);
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('歩行リズム実験'),
-        centerTitle: true,
-        automaticallyImplyLeading: false,
-      ),
-      body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // フェーズ表示
-              _buildPhaseDisplay(settings),
-
-              const SizedBox(height: 16),
-
-              // リズム表示
-              _buildRhythmDisplay(_currentBpm, _targetBpm, settings),
-
-              const SizedBox(height: 16),
-
-              // グラフ表示
-              Expanded(
-                child:
-                    _buildRhythmGraph(_rhythmDataPoints, _targetBpm, settings),
-              ),
-
-              const SizedBox(height: 16),
-
-              // 実験中止ボタン
-              Align(
-                alignment: Alignment.center,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.stop),
-                  label: const Text('実験中止'),
-                  onPressed: _confirmAbortExperiment,
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 24, vertical: 12),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // フェーズ表示テキスト
-  String _getPhaseDisplayText(ExperimentPhase phase) {
-    switch (phase) {
-      case ExperimentPhase.calibration:
-        return 'キャリブレーション';
-      case ExperimentPhase.silentWalking:
-        return '無音歩行';
-      case ExperimentPhase.syncWithNaturalTempo:
-        return '自然リズムと同期';
-      case ExperimentPhase.rhythmGuidance1:
-        return 'リズム誘導 1';
-      case ExperimentPhase.rhythmGuidance2:
-        return 'リズム誘導 2';
-      case ExperimentPhase.cooldown:
-        return 'クールダウン';
-      case ExperimentPhase.completed:
-        return '実験完了';
-      default:
-        return '準備中';
     }
   }
 }

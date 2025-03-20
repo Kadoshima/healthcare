@@ -1,14 +1,20 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import '../models/gait_data.dart';
 
+/// 改良版SensorService - 歩行リズム測定の精度向上のための改良
 class SensorService {
   // ストリームコントローラー
   final _accelerometerDataController =
       StreamController<AccelerometerData>.broadcast();
   final _gaitRhythmController = StreamController<double>.broadcast();
+
+  // キャリブレーション結果用のコントローラー
+  final _calibrationResultController =
+      StreamController<CalibrationResult>.broadcast();
 
   // 購読管理
   StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
@@ -25,24 +31,63 @@ class SensorService {
   double _currentBpm = 0.0;
   bool _isWalking = false;
 
+  // キャリブレーション状態
+  bool _isCalibrating = false;
+  double _targetCalibrationBpm = 0.0;
+  List<CalibrationPoint> _calibrationPoints = [];
+
+  // 精度メトリクス
+  double _currentAccuracy = 0.0; // 推定精度（%）
+  double _confidenceLevel = 0.0; // 信頼度レベル（0.0-1.0）
+
   // 歩行検出のパラメータ
-  final double _activityThreshold = 0.15; // 活動検出の閾値（加速度の標準偏差）
+  double _activityThreshold = 0.15; // 活動検出の閾値（加速度の標準偏差）
   final int _minConsecutiveSteps = 4; // 歩行と判断する最小連続ステップ数
 
   // フィルタリングパラメータ
-  final double _lowCutHz = 0.5; // ハイパスフィルタのカットオフ周波数（Hz）
-  final double _highCutHz = 3.0; // ローパスフィルタのカットオフ周波数（Hz）
+  double _lowCutHz = 0.5; // ハイパスフィルタのカットオフ周波数（Hz）
+  double _highCutHz = 3.0; // ローパスフィルタのカットオフ周波数（Hz）
+
+  // センサー位置に基づくパラメータ調整
+  final Map<String, Map<String, double>> _sensorPositionParams = {
+    '腰部': {
+      'lowCutHz': 0.5,
+      'highCutHz': 3.0,
+      'activityThreshold': 0.15,
+      'peakThreshold': 0.5,
+    },
+    '足首': {
+      'lowCutHz': 0.8,
+      'highCutHz': 4.0,
+      'activityThreshold': 0.25,
+      'peakThreshold': 0.6,
+    },
+  };
 
   // 自己相関データ
   List<double> _autoCorrelation = [];
 
   // ピーク検出パラメータ
-  final double _peakThreshold = 0.5; // ピーク閾値（標準偏差の倍数）
+  double _peakThreshold = 0.5; // ピーク閾値（標準偏差の倍数）
   final int _minPeakDistance = 15; // ピーク間の最小サンプル数（約0.3秒）
 
   // 過去のBPM値を保存するキュー（平滑化用）
   final Queue<double> _recentBpms = Queue<double>();
   final int _bpmQueueSize = 5; // BPM平滑化のためのキューサイズ
+
+  // アルゴリズム重み付け
+  double _autocorrelationWeight = 0.6;
+  double _peakDetectionWeight = 0.3;
+  double _fftWeight = 0.1;
+
+  // 補正係数（キャリブレーション後に設定）
+  double _calibrationMultiplier = 1.0;
+  double _calibrationOffset = 0.0;
+
+  // 検証用パラメータ
+  final List<double> _verificationErrors = [];
+  double _avgVerificationError = 0.0;
+  int _verificationCount = 0;
 
   // センサー状態
   bool _isRunning = false;
@@ -51,19 +96,55 @@ class SensorService {
   Stream<AccelerometerData> get accelerometerStream =>
       _accelerometerDataController.stream;
   Stream<double> get gaitRhythmStream => _gaitRhythmController.stream;
+  Stream<CalibrationResult> get calibrationResultStream =>
+      _calibrationResultController.stream;
 
-  // 現在の歩行リズム
+  // 公開プロパティ
   double get currentBpm => _currentBpm;
   bool get isWalking => _isWalking;
+  bool get isCalibrating => _isCalibrating;
+  double get currentAccuracy => _currentAccuracy;
+  double get confidenceLevel => _confidenceLevel;
+  List<CalibrationPoint> get calibrationPoints =>
+      List.unmodifiable(_calibrationPoints);
+  double get avgVerificationError => _avgVerificationError;
 
   // センサーの初期化
-  Future<bool> initialize() async {
+  Future<bool> initialize({String sensorPosition = '腰部'}) async {
     try {
-      // センサーの有効性チェックなど、必要な初期化処理
+      // センサー位置に基づくパラメータ設定
+      _adjustParametersForPosition(sensorPosition);
+
+      // 初回キャリブレーションの設定
+      _calibrationPoints = [
+        CalibrationPoint(targetBpm: 80, measuredBpm: 80, error: 0),
+        CalibrationPoint(targetBpm: 100, measuredBpm: 100, error: 0),
+        CalibrationPoint(targetBpm: 120, measuredBpm: 120, error: 0),
+      ];
+
+      // デフォルトは補正なし
+      _calibrationMultiplier = 1.0;
+      _calibrationOffset = 0.0;
+
       return true;
     } catch (e) {
-      print('センサー初期化エラー: $e');
+      debugPrint('センサー初期化エラー: $e');
       return false;
+    }
+  }
+
+  // センサー位置に基づくパラメータ調整
+  void _adjustParametersForPosition(String position) {
+    if (_sensorPositionParams.containsKey(position)) {
+      final params = _sensorPositionParams[position]!;
+      _lowCutHz = params['lowCutHz']!;
+      _highCutHz = params['highCutHz']!;
+      _activityThreshold = params['activityThreshold']!;
+      _peakThreshold = params['peakThreshold']!;
+
+      debugPrint('センサー位置 $position に合わせてパラメータを調整しました');
+      debugPrint('低周波カットオフ: $_lowCutHz, 高周波カットオフ: $_highCutHz');
+      debugPrint('活動閾値: $_activityThreshold, ピーク閾値: $_peakThreshold');
     }
   }
 
@@ -113,6 +194,149 @@ class SensorService {
     _accelerometerSubscription = null;
   }
 
+  // キャリブレーション開始
+  void startCalibration(double targetBpm) {
+    _isCalibrating = true;
+    _targetCalibrationBpm = targetBpm;
+    _verificationErrors.clear();
+
+    debugPrint('キャリブレーション開始: 目標 BPM = $_targetCalibrationBpm');
+  }
+
+  // キャリブレーション終了
+  void stopCalibration() {
+    if (!_isCalibrating) return;
+
+    final List<double> measuredBpms = List.from(_recentBpms);
+    if (measuredBpms.isEmpty) {
+      debugPrint('キャリブレーション失敗: 測定データなし');
+      _isCalibrating = false;
+      return;
+    }
+
+    // 測定された平均BPM値
+    measuredBpms.sort();
+    final measuredBpm = measuredBpms[measuredBpms.length ~/ 2]; // 中央値
+    final error = measuredBpm - _targetCalibrationBpm;
+
+    // キャリブレーションポイントの追加・更新
+    bool updated = false;
+    for (int i = 0; i < _calibrationPoints.length; i++) {
+      if ((_calibrationPoints[i].targetBpm - _targetCalibrationBpm).abs() < 5) {
+        _calibrationPoints[i] = CalibrationPoint(
+          targetBpm: _targetCalibrationBpm,
+          measuredBpm: measuredBpm,
+          error: error,
+        );
+        updated = true;
+        break;
+      }
+    }
+
+    if (!updated) {
+      _calibrationPoints.add(CalibrationPoint(
+        targetBpm: _targetCalibrationBpm,
+        measuredBpm: measuredBpm,
+        error: error,
+      ));
+    }
+
+    // 補正係数の計算（線形回帰）
+    _calculateCalibrationCoefficients();
+
+    // 結果を送信
+    final result = CalibrationResult(
+      targetBpm: _targetCalibrationBpm,
+      measuredBpm: measuredBpm,
+      error: error,
+      calibrationMultiplier: _calibrationMultiplier,
+      calibrationOffset: _calibrationOffset,
+      points: List.from(_calibrationPoints),
+    );
+
+    _calibrationResultController.add(result);
+
+    debugPrint(
+        'キャリブレーション完了: 目標=$_targetCalibrationBpm, 測定=$measuredBpm, 誤差=$error');
+    debugPrint('補正係数: 乗数=$_calibrationMultiplier, オフセット=$_calibrationOffset');
+
+    _isCalibrating = false;
+  }
+
+  // 補正係数の計算（線形回帰）
+  void _calculateCalibrationCoefficients() {
+    if (_calibrationPoints.length < 2) {
+      // データ不足の場合はデフォルト値を使用
+      _calibrationMultiplier = 1.0;
+      _calibrationOffset = 0.0;
+      return;
+    }
+
+    // 線形回帰のための変数
+    double sumX = 0.0;
+    double sumY = 0.0;
+    double sumXY = 0.0;
+    double sumX2 = 0.0;
+    int n = _calibrationPoints.length;
+
+    for (final point in _calibrationPoints) {
+      sumX += point.measuredBpm;
+      sumY += point.targetBpm;
+      sumXY += point.measuredBpm * point.targetBpm;
+      sumX2 += point.measuredBpm * point.measuredBpm;
+    }
+
+    // 傾きとオフセットの計算
+    double denominator = n * sumX2 - sumX * sumX;
+    if (denominator.abs() < 0.001) {
+      // 分母がほぼ0の場合
+      _calibrationMultiplier = 1.0;
+      _calibrationOffset = 0.0;
+    } else {
+      _calibrationMultiplier = (n * sumXY - sumX * sumY) / denominator;
+      _calibrationOffset = (sumY - _calibrationMultiplier * sumX) / n;
+
+      // 異常値チェック（極端な補正を避ける）
+      if (_calibrationMultiplier < 0.5 || _calibrationMultiplier > 2.0) {
+        debugPrint('警告: 異常な補正係数が計算されました。デフォルト値を使用します。');
+        _calibrationMultiplier = 1.0;
+        _calibrationOffset = 0.0;
+      }
+    }
+  }
+
+  // 精度の検証
+  void verifyAccuracy(double knownBpm) {
+    if (!_isRunning || !_isWalking || _currentBpm <= 0) return;
+
+    // 現在の測定値とknownBpmの差を計算
+    final error = (_currentBpm - knownBpm).abs();
+    final percentError = (error / knownBpm) * 100;
+
+    _verificationErrors.add(percentError);
+    _verificationCount++;
+
+    // 平均誤差の更新
+    double sum = 0.0;
+    for (final err in _verificationErrors) {
+      sum += err;
+    }
+    _avgVerificationError = sum / _verificationErrors.length;
+
+    // 信頼度の更新
+    _confidenceLevel = math.max(0.0, 1.0 - (_avgVerificationError / 20.0));
+    if (_confidenceLevel > 1.0) _confidenceLevel = 1.0;
+
+    // 精度の計算（100% - 平均誤差%）
+    _currentAccuracy = 100.0 - _avgVerificationError;
+    if (_currentAccuracy < 0.0) _currentAccuracy = 0.0;
+
+    debugPrint(
+        '精度検証: 既知=$knownBpm, 測定=$_currentBpm, 誤差=$error (${percentError.toStringAsFixed(1)}%)');
+    debugPrint(
+        '現在の推定精度: ${_currentAccuracy.toStringAsFixed(1)}%, 信頼度: ${(_confidenceLevel * 100).toStringAsFixed(1)}%');
+  }
+
   // 加速度データの処理（フィルタリングと歩行リズム検出）
   void _processAccelerometerData() {
     if (_recentData.length < 200) return; // 少なくとも4秒分のデータが必要
@@ -139,36 +363,59 @@ class SensorService {
       // 2. 信号前処理（フィルタリング）
       _filteredMagnitudes = _applyBandpassFilter(magnitudes);
 
-      // 3. 歩行リズムの検出
-      // 最も信頼性の高い方法で検出（自己相関法を優先）
+      // 3. 複数の方法で歩行リズムを検出し、重み付けで統合
+      double autocorrBpm = 0.0, peakBpm = 0.0, fftBpm = 0.0;
+
+      // 3.1 自己相関法によるBPM検出
+      autocorrBpm = _detectBpmByAutocorrelation();
+
+      // 3.2 ピーク検出法によるBPM検出
+      peakBpm = _detectBpmByPeakCounting();
+
+      // 3.3 FFT法によるBPM検出
+      fftBpm = _detectBpmBySimpleFFT();
+
+      // 3.4 検出結果の統合（重み付け）
       double detectedBpm = 0.0;
+      double totalWeight = 0.0;
 
-      // 3.1 自己相関法によるBPM検出（最も信頼性が高い）
-      final autoCorrBpm = _detectBpmByAutocorrelation();
-
-      if (autoCorrBpm > 40 && autoCorrBpm < 150) {
-        // 有効な自己相関BPMが検出された場合はそれを使用
-        detectedBpm = autoCorrBpm;
-      } else {
-        // 自己相関法が失敗した場合はピーク検出法を試す
-        final peakBpm = _detectBpmByPeakCounting();
-
-        if (peakBpm > 40 && peakBpm < 150) {
-          detectedBpm = peakBpm;
-        } else {
-          // 最後の手段としてFFT法を使用
-          final fftBpm = _detectBpmBySimpleFFT();
-          if (fftBpm > 40 && fftBpm < 150) {
-            detectedBpm = fftBpm;
-          }
-        }
+      // 有効値のみ重み付け
+      if (autocorrBpm >= 40 && autocorrBpm <= 160) {
+        detectedBpm += autocorrBpm * _autocorrelationWeight;
+        totalWeight += _autocorrelationWeight;
       }
 
-      // 有効なBPMが検出されなかった場合
-      if (detectedBpm <= 0) return;
+      if (peakBpm >= 40 && peakBpm <= 160) {
+        detectedBpm += peakBpm * _peakDetectionWeight;
+        totalWeight += _peakDetectionWeight;
+      }
+
+      if (fftBpm >= 40 && fftBpm <= 160) {
+        detectedBpm += fftBpm * _fftWeight;
+        totalWeight += _fftWeight;
+      }
+
+      // 有効な重みがある場合のみ計算
+      if (totalWeight > 0) {
+        detectedBpm /= totalWeight;
+      } else {
+        // すべての方法が失敗した場合
+        return;
+      }
+
+      // 4. キャリブレーション補正の適用
+      final calibratedBpm =
+          detectedBpm * _calibrationMultiplier + _calibrationOffset;
+
+      // デバッグログ（詳細な検出結果）
+      if (detectedBpm > 0) {
+        debugPrint('BPM検出: 自己相関=$autocorrBpm, ピーク=$peakBpm, FFT=$fftBpm');
+        debugPrint(
+            '統合BPM=$detectedBpm, 補正後=${calibratedBpm.toStringAsFixed(1)}');
+      }
 
       // 5. 平滑化（急激な変化を防止）
-      _recentBpms.add(detectedBpm);
+      _recentBpms.add(calibratedBpm);
       if (_recentBpms.length > _bpmQueueSize) {
         _recentBpms.removeFirst();
       }
@@ -187,7 +434,7 @@ class SensorService {
       }
     } catch (e) {
       // エラーが発生した場合でも継続処理
-      print('歩行リズム検出エラー: $e');
+      debugPrint('歩行リズム検出エラー: $e');
     }
   }
 
@@ -499,5 +746,38 @@ class SensorService {
     stopSensing();
     _accelerometerDataController.close();
     _gaitRhythmController.close();
+    _calibrationResultController.close();
   }
+}
+
+/// キャリブレーションポイント（目標BPMと測定BPMの対応）
+class CalibrationPoint {
+  final double targetBpm; // 目標BPM
+  final double measuredBpm; // 測定されたBPM
+  final double error; // 誤差
+
+  CalibrationPoint({
+    required this.targetBpm,
+    required this.measuredBpm,
+    required this.error,
+  });
+}
+
+/// キャリブレーション結果
+class CalibrationResult {
+  final double targetBpm;
+  final double measuredBpm;
+  final double error;
+  final double calibrationMultiplier;
+  final double calibrationOffset;
+  final List<CalibrationPoint> points;
+
+  CalibrationResult({
+    required this.targetBpm,
+    required this.measuredBpm,
+    required this.error,
+    required this.calibrationMultiplier,
+    required this.calibrationOffset,
+    required this.points,
+  });
 }

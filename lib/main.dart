@@ -17,9 +17,13 @@ import 'models/experiment_settings.dart';
 // 画面
 import 'screens/home_screen.dart';
 import 'screens/experiment_screen.dart';
+import 'screens/improved_experiment_screen.dart'; // 改良版実験画面
+import 'screens/calibration_screen.dart'; // キャリブレーション画面
 import 'screens/results_screen.dart';
 import 'screens/researcher_dashboard.dart';
 import 'screens/metronome_settings_screen.dart';
+import 'widgets/walking_rhythm_metrics.dart'; // 精度メトリクス表示ウィジェット
+import 'widgets/experiment_results_summary.dart'; // 実験結果サマリーウィジェット
 
 void main() async {
   // Flutter初期化を確実に実行
@@ -65,7 +69,8 @@ void main() async {
           update: (_, databaseService, __) =>
               ExperimentService(databaseService),
         ),
-        Provider<SensorService>(create: (_) => SensorService()),
+        Provider<SensorService>(
+            create: (_) => SensorService()), // 改良版SensorService
         Provider<ImprovedAudioService>(create: (_) => ImprovedAudioService()),
         Provider<AzureStorageService>.value(value: azureStorageService),
       ],
@@ -140,6 +145,9 @@ class _WalkingRhythmAppState extends State<WalkingRhythmApp> {
       routes: {
         '/home': (context) => const HomeScreen(),
         '/experiment': (context) => const ExperimentScreen(),
+        '/improved_experiment': (context) =>
+            const ImprovedExperimentScreen(), // 改良版実験画面
+        '/calibration': (context) => const CalibrationScreen(), // キャリブレーション画面
         '/results': (context) => ResultsScreen(sessionId: 0),
         '/researcher_dashboard': (context) => const ResearcherDashboard(),
         '/metronome_settings': (context) => const MetronomeSettingsScreen(),
