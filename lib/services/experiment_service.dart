@@ -11,12 +11,21 @@ import '../models/gait_data.dart';
 import 'database_service.dart';
 import 'azure_storage_service.dart';
 
+// グローバルなデバッグロギング用（main.dartと合わせる）
+bool debugMode = true;
+void debugLog(String message) {
+  if (debugMode) {
+    print('[DEBUG] $message');
+  }
+}
+
 class ExperimentService {
   final DatabaseService _database;
 
   // 現在の実験セッション
   int? _currentSessionId;
   Timer? _phaseTimer;
+  bool _isInitialized = false;
 
   // データストリームコントローラー
   final _gaitDataController = StreamController<GaitRhythmData>.broadcast();
@@ -28,39 +37,81 @@ class ExperimentService {
   // 公開ストリーム
   Stream<GaitRhythmData> get gaitDataStream => _gaitDataController.stream;
 
+  // 公開プロパティ
+  bool get isInitialized => _isInitialized;
+  int? get currentSessionId => _currentSessionId;
+
   // コンストラクタ
-  ExperimentService(this._database);
-
-  // 実験セッション開始
-  Future<int> startExperimentSession(ExperimentSettings settings) async {
-    final sessionId = await _database.createExperimentSession(
-      subjectId: settings.subjectId,
-      startTime: DateTime.now(),
-      settings: {
-        'calibrationDuration': settings.calibrationDuration,
-        'silentWalkingDuration': settings.silentWalkingDuration,
-        'syncDuration': settings.syncDuration,
-        'guidance1Duration': settings.guidance1Duration,
-        'guidance2Duration': settings.guidance2Duration,
-        'cooldownDuration': settings.cooldownDuration,
-        'tempoIncrement': settings.tempoIncrement,
-        'sensorPosition': settings.sensorPosition,
-        'samplingRate': settings.samplingRate,
-        'clickSoundType': settings.clickSoundType,
-        'volume': settings.volume,
-      },
-    );
-
-    _currentSessionId = sessionId;
-    _sessionGaitData.clear();
-    _sessionPhaseData.clear();
-
-    return sessionId;
+  ExperimentService(this._database) {
+    _initialize();
   }
 
-  // 実験フェーズ開始
+  // 初期化処理
+  Future<void> _initialize() async {
+    try {
+      debugLog('ExperimentService: 初期化を開始します');
+
+      // データベースが初期化されていることを確認
+      await _database.initialize();
+
+      _isInitialized = true;
+      debugLog('ExperimentService: 初期化が完了しました');
+    } catch (e) {
+      debugLog('ExperimentService: 初期化エラー: $e');
+      _isInitialized = false;
+    }
+  }
+
+  // 実験セッション開始 - 改良版
+  Future<int> startExperimentSession(ExperimentSettings settings) async {
+    if (!_isInitialized) {
+      debugLog('ExperimentService: 初期化が完了していません。再初期化を行います');
+      await _initialize();
+    }
+
+    debugLog('ExperimentService: 実験セッションを開始します');
+
+    try {
+      final sessionId = await _database.createExperimentSession(
+        subjectId: settings.subjectId,
+        startTime: DateTime.now(),
+        settings: {
+          'calibrationDuration': settings.calibrationDuration,
+          'silentWalkingDuration': settings.silentWalkingDuration,
+          'syncDuration': settings.syncDuration,
+          'guidance1Duration': settings.guidance1Duration,
+          'guidance2Duration': settings.guidance2Duration,
+          'cooldownDuration': settings.cooldownDuration,
+          'tempoIncrement': settings.tempoIncrement,
+          'sensorPosition': settings.sensorPosition,
+          'samplingRate': settings.samplingRate,
+          'clickSoundType': settings.clickSoundType,
+          'volume': settings.volume,
+        },
+      );
+
+      _currentSessionId = sessionId;
+      _sessionGaitData.clear();
+      _sessionPhaseData.clear();
+
+      debugLog('ExperimentService: 実験セッションを開始しました: セッションID = $sessionId');
+      return sessionId;
+    } catch (e) {
+      debugLog('ExperimentService: 実験セッション開始エラー: $e');
+      rethrow;
+    }
+  }
+
+  // 実験フェーズ開始 - 改良版
   void startPhase(ExperimentPhase phase, ExperimentSettings settings,
       Function onPhaseComplete) {
+    if (_currentSessionId == null) {
+      debugLog('ExperimentService: 警告 - 現在のセッションがないため、フェーズを開始できません');
+      return;
+    }
+
+    debugLog('ExperimentService: フェーズを開始します: $phase');
+
     // 現在のフェーズのデータを記録
     final phaseData = ExperimentPhaseData(
       name: phase.toString(),
@@ -70,35 +121,17 @@ class ExperimentService {
     );
 
     _sessionPhaseData.add(phaseData);
+    debugLog(
+        'ExperimentService: フェーズデータを記録しました: ${phaseData.name}, 目標テンポ: ${phaseData.targetTempo}');
 
     // フェーズの持続時間を取得
-    int phaseDuration;
-    switch (phase) {
-      case ExperimentPhase.calibration:
-        phaseDuration = settings.calibrationDuration;
-        break;
-      case ExperimentPhase.silentWalking:
-        phaseDuration = settings.silentWalkingDuration;
-        break;
-      case ExperimentPhase.syncWithNaturalTempo:
-        phaseDuration = settings.syncDuration;
-        break;
-      case ExperimentPhase.rhythmGuidance1:
-        phaseDuration = settings.guidance1Duration;
-        break;
-      case ExperimentPhase.rhythmGuidance2:
-        phaseDuration = settings.guidance2Duration;
-        break;
-      case ExperimentPhase.cooldown:
-        phaseDuration = settings.cooldownDuration;
-        break;
-      default:
-        phaseDuration = 0;
-    }
+    int phaseDuration = _getPhaseDuration(phase, settings);
+    debugLog('ExperimentService: フェーズ持続時間: $phaseDuration 秒');
 
     // フェーズタイマーをセット
     _phaseTimer?.cancel();
     if (phaseDuration > 0) {
+      debugLog('ExperimentService: フェーズタイマーを開始します');
       _phaseTimer = Timer(Duration(seconds: phaseDuration), () {
         // フェーズ終了処理
         final updatedPhaseData = _sessionPhaseData.last.copyWith(
@@ -106,9 +139,48 @@ class ExperimentService {
         );
         _sessionPhaseData[_sessionPhaseData.length - 1] = updatedPhaseData;
 
+        debugLog('ExperimentService: フェーズを完了します: ${updatedPhaseData.name}');
+
+        // データベースにフェーズデータを保存
+        _savePhaseData(updatedPhaseData);
+
         // フェーズ完了コールバック
         onPhaseComplete();
       });
+    } else {
+      debugLog('ExperimentService: フェーズ持続時間が0以下です。タイマーは設定しません');
+    }
+  }
+
+  // フェーズの持続時間を取得
+  int _getPhaseDuration(ExperimentPhase phase, ExperimentSettings settings) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return settings.calibrationDuration;
+      case ExperimentPhase.silentWalking:
+        return settings.silentWalkingDuration;
+      case ExperimentPhase.syncWithNaturalTempo:
+        return settings.syncDuration;
+      case ExperimentPhase.rhythmGuidance1:
+        return settings.guidance1Duration;
+      case ExperimentPhase.rhythmGuidance2:
+        return settings.guidance2Duration;
+      case ExperimentPhase.cooldown:
+        return settings.cooldownDuration;
+      default:
+        return 0;
+    }
+  }
+
+  // フェーズデータの保存
+  Future<void> _savePhaseData(ExperimentPhaseData phaseData) async {
+    if (_currentSessionId == null) return;
+
+    try {
+      await _database.addPhaseData(_currentSessionId!, phaseData);
+      debugLog('ExperimentService: フェーズデータをデータベースに保存しました: ${phaseData.name}');
+    } catch (e) {
+      debugLog('ExperimentService: フェーズデータの保存エラー: $e');
     }
   }
 
@@ -116,6 +188,7 @@ class ExperimentService {
   void cancelCurrentPhase() {
     _phaseTimer?.cancel();
     _phaseTimer = null;
+    debugLog('ExperimentService: 現在のフェーズをキャンセルしました');
 
     // 現在のフェーズのデータを更新
     if (_sessionPhaseData.isNotEmpty) {
@@ -123,12 +196,18 @@ class ExperimentService {
         endTime: DateTime.now(),
       );
       _sessionPhaseData[_sessionPhaseData.length - 1] = updatedPhaseData;
+
+      // データベースにフェーズデータを保存
+      _savePhaseData(updatedPhaseData);
     }
   }
 
   // 歩行リズムデータの追加
   void addGaitRhythmData(double bpm, ExperimentPhase phase, double targetBpm) {
-    if (_currentSessionId == null) return;
+    if (_currentSessionId == null) {
+      debugLog('ExperimentService: 警告 - 現在のセッションがないため、データを追加できません');
+      return;
+    }
 
     final data = GaitRhythmData(
       timestamp: DateTime.now(),
@@ -142,6 +221,8 @@ class ExperimentService {
 
     // 定期的にデータベースに保存（メモリ使用量削減のため）
     if (_sessionGaitData.length % 100 == 0) {
+      debugLog(
+          'ExperimentService: 歩行リズムデータをバッチ保存します: ${_sessionGaitData.length}件');
       _saveGaitDataBatch();
     }
   }
@@ -158,8 +239,10 @@ class ExperimentService {
         _currentSessionId!,
         batchData,
       );
+      debugLog(
+          'ExperimentService: 歩行リズムデータをデータベースに保存しました: ${batchData.length}件');
     } catch (e) {
-      debugPrint('歩行リズムデータ保存エラー: $e');
+      debugLog('ExperimentService: 歩行リズムデータ保存エラー: $e');
       // エラー発生時はデータを復元
       _sessionGaitData.insertAll(0, batchData);
     }
@@ -167,29 +250,54 @@ class ExperimentService {
 
   // 実験セッション完了
   Future<void> completeExperimentSession() async {
-    if (_currentSessionId == null) return;
-
-    // 残りのデータをデータベースに保存
-    await _saveGaitDataBatch();
-
-    // フェーズデータを保存
-    for (var phaseData in _sessionPhaseData) {
-      await _database.addPhaseData(_currentSessionId!, phaseData);
+    if (_currentSessionId == null) {
+      debugLog('ExperimentService: 警告 - 現在のセッションがないため、完了できません');
+      return;
     }
 
-    // セッションを完了状態に更新
-    await _database.updateExperimentSession(
-      _currentSessionId!,
-      endTime: DateTime.now(),
-    );
+    debugLog('ExperimentService: 実験セッションを完了します: セッションID = $_currentSessionId');
 
-    _phaseTimer?.cancel();
-    _phaseTimer = null;
-    _currentSessionId = null;
+    try {
+      // 残りのデータをデータベースに保存
+      await _saveGaitDataBatch();
+      debugLog('ExperimentService: 残りの歩行リズムデータを保存しました');
+
+      // 残りのフェーズデータを保存
+      for (var phaseData in _sessionPhaseData) {
+        if (phaseData.endTime == null) {
+          // 終了時間が設定されていないフェーズは現在時刻で終了
+          final updatedPhaseData = phaseData.copyWith(
+            endTime: DateTime.now(),
+          );
+          await _database.addPhaseData(_currentSessionId!, updatedPhaseData);
+          debugLog('ExperimentService: 未完了のフェーズデータを保存しました: ${phaseData.name}');
+        } else {
+          await _database.addPhaseData(_currentSessionId!, phaseData);
+        }
+      }
+
+      // セッションを完了状態に更新
+      await _database.updateExperimentSession(
+        _currentSessionId!,
+        endTime: DateTime.now(),
+      );
+      debugLog('ExperimentService: 実験セッションを完了状態に更新しました');
+
+      _phaseTimer?.cancel();
+      _phaseTimer = null;
+
+      // セッションIDを保持（結果画面で使用するため）
+      // _currentSessionId = null;
+    } catch (e) {
+      debugLog('ExperimentService: 実験セッション完了エラー: $e');
+      rethrow;
+    }
   }
 
   // データのCSVエクスポート
   Future<String> exportSessionDataToCsv(int sessionId) async {
+    debugLog('ExperimentService: セッションデータをCSVにエクスポートします: セッションID = $sessionId');
+
     try {
       // セッション情報の取得
       final session = await _database.getExperimentSession(sessionId);
@@ -204,9 +312,19 @@ class ExperimentService {
       final directory = await getApplicationDocumentsDirectory();
       final path = directory.path;
 
+      // 出力ディレクトリを作成
+      final outputDir = Directory('$path/export_session_$sessionId');
+      if (!await outputDir.exists()) {
+        await outputDir.create(recursive: true);
+      }
+
+      debugLog('ExperimentService: エクスポートディレクトリを作成しました: ${outputDir.path}');
+
       // セッション情報ファイル
-      final sessionInfoFile = File('$path/session_${sessionId}_info.json');
+      final sessionInfoFile =
+          File('${outputDir.path}/session_${sessionId}_info.json');
       await sessionInfoFile.writeAsString(jsonEncode(session.toMap()));
+      debugLog('ExperimentService: セッション情報をJSONに保存しました');
 
       // 歩行リズムデータCSV
       final rhythmDataCsv = [
@@ -221,8 +339,10 @@ class ExperimentService {
 
       final rhythmDataString =
           const ListToCsvConverter().convert(rhythmDataCsv);
-      final rhythmFile = File('$path/session_${sessionId}_rhythm_data.csv');
+      final rhythmFile =
+          File('${outputDir.path}/session_${sessionId}_rhythm_data.csv');
       await rhythmFile.writeAsString(rhythmDataString);
+      debugLog('ExperimentService: 歩行リズムデータをCSVに保存しました: ${rhythmData.length}件');
 
       // フェーズデータCSV
       final phaseDataCsv = [
@@ -237,15 +357,18 @@ class ExperimentService {
       ];
 
       final phaseDataString = const ListToCsvConverter().convert(phaseDataCsv);
-      final phaseFile = File('$path/session_${sessionId}_phase_data.csv');
+      final phaseFile =
+          File('${outputDir.path}/session_${sessionId}_phase_data.csv');
       await phaseFile.writeAsString(phaseDataString);
+      debugLog('ExperimentService: フェーズデータをCSVに保存しました: ${phaseData.length}件');
 
       // 分析結果のエクスポート
-      await _exportAnalysisResults(sessionId, path, rhythmData, phaseData);
+      await _exportAnalysisResults(
+          sessionId, outputDir.path, rhythmData, phaseData);
 
-      return path;
+      return outputDir.path;
     } catch (e) {
-      debugPrint('データエクスポートエラー: $e');
+      debugLog('ExperimentService: データエクスポートエラー: $e');
       rethrow;
     }
   }
@@ -257,6 +380,8 @@ class ExperimentService {
       List<GaitRhythmData> rhythmData,
       List<ExperimentPhaseData> phaseData) async {
     try {
+      debugLog('ExperimentService: 分析結果をエクスポートします');
+
       // 分析を実行
       final analysisResults = _analyzeExperimentData(rhythmData, phaseData);
 
@@ -264,6 +389,7 @@ class ExperimentService {
       final analysisFile =
           File('$exportPath/session_${sessionId}_analysis.json');
       await analysisFile.writeAsString(jsonEncode(analysisResults));
+      debugLog('ExperimentService: 分析結果をJSONに保存しました');
 
       // 分析サマリーをCSVで保存
       final summaryCsv = [
@@ -299,8 +425,9 @@ class ExperimentService {
       final summaryString = const ListToCsvConverter().convert(summaryCsv);
       final summaryFile = File('$exportPath/session_${sessionId}_summary.csv');
       await summaryFile.writeAsString(summaryString);
+      debugLog('ExperimentService: 分析サマリーをCSVに保存しました');
     } catch (e) {
-      debugPrint('分析結果エクスポートエラー: $e');
+      debugLog('ExperimentService: 分析結果エクスポートエラー: $e');
     }
   }
 
@@ -312,8 +439,12 @@ class ExperimentService {
     final results = <String, dynamic>{};
 
     if (rhythmData.isEmpty || phaseData.isEmpty) {
+      debugLog('ExperimentService: 分析するデータがありません');
       return results;
     }
+
+    debugLog(
+        'ExperimentService: 実験データの分析を開始します: リズムデータ ${rhythmData.length}件, フェーズデータ ${phaseData.length}件');
 
     // 自然歩行リズム（無音フェーズの平均）
     final silentPhaseData = rhythmData
@@ -326,12 +457,17 @@ class ExperimentService {
           silentBpms.reduce((a, b) => a + b) / silentBpms.length;
       results['naturalTempo'] = naturalTempo;
 
+      debugLog(
+          'ExperimentService: 自然歩行リズム: $naturalTempo BPM (${silentBpms.length}サンプル)');
+
       // 標準偏差
       final sumSquaredDiffs = silentBpms
           .map((bpm) => (bpm - naturalTempo) * (bpm - naturalTempo))
           .reduce((a, b) => a + b);
       final stdDev = math.sqrt(sumSquaredDiffs / silentBpms.length);
       results['naturalTempoStdDev'] = stdDev;
+
+      debugLog('ExperimentService: 自然歩行リズム標準偏差: $stdDev BPM');
     }
 
     // 各フェーズの平均と標準偏差
@@ -342,6 +478,9 @@ class ExperimentService {
       if (phaseRhythmData.isNotEmpty) {
         final bpms = phaseRhythmData.map((data) => data.bpm).toList();
         final avgBpm = bpms.reduce((a, b) => a + b) / bpms.length;
+
+        debugLog(
+            'ExperimentService: フェーズ ${phase.name} の平均BPM: $avgBpm (${bpms.length}サンプル)');
 
         // 標準偏差
         final sumSquaredDiffs = bpms
@@ -359,6 +498,9 @@ class ExperimentService {
           final diff = avgBpm - targetBpm;
           results['${phase.name}_diffFromTarget'] = diff;
           results['${phase.name}_diffPercentage'] = (diff / targetBpm) * 100;
+
+          debugLog(
+              'ExperimentService: フェーズ ${phase.name} の目標との差: $diff BPM (${(diff / targetBpm) * 100}%)');
         }
       }
     }
@@ -381,6 +523,8 @@ class ExperimentService {
       // 変動係数
       final cv = stdDev / avgBpm;
       results['syncPhase_cv'] = cv;
+
+      debugLog('ExperimentService: 同期フェーズの変動係数: $cv');
     }
 
     // 誘導フェーズでの追従度
@@ -415,6 +559,9 @@ class ExperimentService {
 
       results['guidance1_timeTrend'] = timeTrend;
 
+      debugLog(
+          'ExperimentService: 誘導フェーズ1の時間トレンドを計算しました: ${timeTrend.length}ポイント');
+
       // 開始時と終了時の差
       if (timeTrend.isNotEmpty) {
         final keys = timeTrend.keys.toList()..sort();
@@ -422,10 +569,13 @@ class ExperimentService {
           final startBpm = timeTrend[keys.first] ?? 0;
           final endBpm = timeTrend[keys.last] ?? 0;
           results['guidance1_adaptationAmount'] = endBpm - startBpm;
+
+          debugLog('ExperimentService: 誘導フェーズ1の適応量: ${endBpm - startBpm} BPM');
         }
       }
     }
 
+    debugLog('ExperimentService: 実験データの分析を完了しました: ${results.length}メトリクス');
     return results;
   }
 
@@ -434,6 +584,9 @@ class ExperimentService {
       int sessionId, AzureStorageService azureStorage,
       {Function(double)? progressCallback}) async {
     try {
+      debugLog(
+          'ExperimentService: AzureへのデータアップロードD7D7を開始します: セッションID = $sessionId');
+
       // まずデータをエクスポート
       final exportPath = await exportSessionDataToCsv(sessionId);
 
@@ -444,17 +597,22 @@ class ExperimentService {
       final result = await azureStorage.uploadSessionData(sessionId, exportPath,
           subjectId: session.subjectId, progressCallback: progressCallback);
 
+      debugLog('ExperimentService: Azureへのアップロード結果: $result');
       return result;
     } catch (e) {
-      debugPrint('Azureアップロードエラー: $e');
+      debugLog('ExperimentService: Azureアップロードエラー: $e');
       return false;
     }
   }
 
   // リソース解放
   void dispose() {
+    debugLog('ExperimentService: リソースを解放します');
+
     _phaseTimer?.cancel();
     _gaitDataController.close();
+
+    debugLog('ExperimentService: すべてのリソースを解放しました');
   }
 }
 

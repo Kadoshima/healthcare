@@ -5,6 +5,14 @@ import 'package:flutter/foundation.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import '../models/gait_data.dart';
 
+// グローバルなデバッグロギング用（main.dartと合わせる）
+bool debugMode = true;
+void debugLog(String message) {
+  if (debugMode) {
+    print('[DEBUG] $message');
+  }
+}
+
 /// 改良版SensorService - 歩行リズム測定の精度向上のための改良
 class SensorService {
   // ストリームコントローラー
@@ -30,6 +38,7 @@ class SensorService {
   // 状態変数
   double _currentBpm = 0.0;
   bool _isWalking = false;
+  bool _isInitialized = false;
 
   // キャリブレーション状態
   bool _isCalibrating = false;
@@ -103,38 +112,81 @@ class SensorService {
   double get currentBpm => _currentBpm;
   bool get isWalking => _isWalking;
   bool get isCalibrating => _isCalibrating;
+  bool get isInitialized => _isInitialized;
   double get currentAccuracy => _currentAccuracy;
   double get confidenceLevel => _confidenceLevel;
   List<CalibrationPoint> get calibrationPoints =>
       List.unmodifiable(_calibrationPoints);
   double get avgVerificationError => _avgVerificationError;
 
-  // センサーの初期化
+  // センサーの初期化 - 改良版
   Future<bool> initialize({String sensorPosition = '腰部'}) async {
+    // 既に初期化済みなら成功を返す
+    if (_isInitialized) {
+      debugLog('SensorService: 既に初期化済みです');
+      return true;
+    }
+
+    debugLog('SensorService: 初期化を開始します。センサー位置: $sensorPosition');
+
     try {
       // センサー位置に基づくパラメータ設定
       _adjustParametersForPosition(sensorPosition);
 
-      // 初回キャリブレーションの設定
-      _calibrationPoints = [
-        CalibrationPoint(targetBpm: 80, measuredBpm: 80, error: 0),
-        CalibrationPoint(targetBpm: 100, measuredBpm: 100, error: 0),
-        CalibrationPoint(targetBpm: 120, measuredBpm: 120, error: 0),
-      ];
+      // センサーの利用可能性をチェック
+      try {
+        // センサーストリームをテスト
+        final testSub = accelerometerEvents.listen((event) {});
+        await testSub.cancel();
+        debugLog('SensorService: センサーが利用可能です');
+      } catch (e) {
+        debugLog('SensorService: センサーアクセスエラー: $e');
+        return false;
+      }
 
-      // デフォルトは補正なし
-      _calibrationMultiplier = 1.0;
-      _calibrationOffset = 0.0;
+      // デフォルトキャリブレーションポイントを設定
+      _setDefaultCalibrationPoints();
 
+      _isInitialized = true;
+      debugLog('SensorService: 初期化が完了しました');
       return true;
     } catch (e) {
-      debugPrint('センサー初期化エラー: $e');
+      debugLog('SensorService: 初期化エラー: $e');
+      _isInitialized = false;
       return false;
     }
   }
 
+  // デフォルトのキャリブレーションポイントを設定
+  void _setDefaultCalibrationPoints() {
+    // 既にキャリブレーションポイントがある場合は保持
+    if (_calibrationPoints.isNotEmpty) {
+      debugLog(
+          'SensorService: 既存のキャリブレーションポイントを保持します: ${_calibrationPoints.length}ポイント');
+      return;
+    }
+
+    debugLog('SensorService: デフォルトのキャリブレーションポイントを設定します');
+
+    // 初回キャリブレーションのデフォルト値を設定
+    _calibrationPoints = [
+      CalibrationPoint(targetBpm: 80, measuredBpm: 80, error: 0),
+      CalibrationPoint(targetBpm: 100, measuredBpm: 100, error: 0),
+      CalibrationPoint(targetBpm: 120, measuredBpm: 120, error: 0),
+    ];
+
+    // デフォルトは補正なし
+    _calibrationMultiplier = 1.0;
+    _calibrationOffset = 0.0;
+
+    debugLog(
+        'SensorService: デフォルトキャリブレーション - 乗数: $_calibrationMultiplier, オフセット: $_calibrationOffset');
+  }
+
   // センサー位置に基づくパラメータ調整
   void _adjustParametersForPosition(String position) {
+    debugLog('SensorService: センサー位置($position)に基づいたパラメータ調整を行います');
+
     if (_sensorPositionParams.containsKey(position)) {
       final params = _sensorPositionParams[position]!;
       _lowCutHz = params['lowCutHz']!;
@@ -142,21 +194,35 @@ class SensorService {
       _activityThreshold = params['activityThreshold']!;
       _peakThreshold = params['peakThreshold']!;
 
-      debugPrint('センサー位置 $position に合わせてパラメータを調整しました');
-      debugPrint('低周波カットオフ: $_lowCutHz, 高周波カットオフ: $_highCutHz');
-      debugPrint('活動閾値: $_activityThreshold, ピーク閾値: $_peakThreshold');
+      debugLog('SensorService: 低周波カットオフ: $_lowCutHz, 高周波カットオフ: $_highCutHz');
+      debugLog(
+          'SensorService: 活動閾値: $_activityThreshold, ピーク閾値: $_peakThreshold');
+    } else {
+      debugLog('SensorService: 指定されたセンサー位置が未定義です。デフォルト値を使用します');
     }
   }
 
-  // センサー開始
+  // センサー開始 - 改良版
   void startSensing() {
-    if (_isRunning) return;
+    debugLog('SensorService: センシングを開始します');
+
+    if (_isRunning) {
+      debugLog('SensorService: センサーは既に実行中です');
+      return;
+    }
+
+    if (!_isInitialized) {
+      debugLog('SensorService: 初期化が完了していません。センシングを開始できません');
+      return;
+    }
 
     _isRunning = true;
     _recentData.clear();
     _filteredMagnitudes.clear();
     _recentBpms.clear();
     _isWalking = false;
+
+    debugLog('SensorService: センサーデータの収集を開始します');
 
     // センサーデータの購読開始
     _accelerometerSubscription =
@@ -185,32 +251,63 @@ class SensorService {
         _processAccelerometerData();
       }
     });
+
+    debugLog('SensorService: センサーデータの購読を開始しました');
   }
 
   // センサー停止
   void stopSensing() {
+    if (!_isRunning) {
+      debugLog('SensorService: センサーは既に停止しています');
+      return;
+    }
+
+    debugLog('SensorService: センシングを停止します');
     _isRunning = false;
     _accelerometerSubscription?.cancel();
     _accelerometerSubscription = null;
+    debugLog('SensorService: センサーデータの購読をキャンセルしました');
   }
 
-  // キャリブレーション開始
+  // キャリブレーション開始 - 改良版
   void startCalibration(double targetBpm) {
+    debugLog('SensorService: キャリブレーションを開始します: 目標 BPM = $targetBpm');
+
+    if (!_isRunning) {
+      debugLog('SensorService: 警告: センサーがオフの状態でキャリブレーションを開始しようとしています');
+      startSensing(); // センサーを起動
+    }
+
     _isCalibrating = true;
     _targetCalibrationBpm = targetBpm;
     _verificationErrors.clear();
-
-    debugPrint('キャリブレーション開始: 目標 BPM = $_targetCalibrationBpm');
+    _recentBpms.clear(); // BPMキューをクリア
   }
 
-  // キャリブレーション終了
+  // キャリブレーション終了 - 改良版
   void stopCalibration() {
-    if (!_isCalibrating) return;
+    if (!_isCalibrating) {
+      debugLog('SensorService: キャリブレーションは実行されていません');
+      return;
+    }
 
     final List<double> measuredBpms = List.from(_recentBpms);
+    debugLog('SensorService: キャリブレーション終了。収集されたBPM数: ${measuredBpms.length}');
+
     if (measuredBpms.isEmpty) {
-      debugPrint('キャリブレーション失敗: 測定データなし');
+      debugLog('SensorService: キャリブレーション失敗: 測定データなし');
       _isCalibrating = false;
+
+      // キャリブレーション失敗の結果を通知
+      final result = CalibrationResult(
+        targetBpm: _targetCalibrationBpm,
+        measuredBpm: 0.0,
+        error: 0.0,
+        calibrationMultiplier: _calibrationMultiplier,
+        calibrationOffset: _calibrationOffset,
+        points: List.from(_calibrationPoints),
+      );
+      _calibrationResultController.add(result);
       return;
     }
 
@@ -218,6 +315,9 @@ class SensorService {
     measuredBpms.sort();
     final measuredBpm = measuredBpms[measuredBpms.length ~/ 2]; // 中央値
     final error = measuredBpm - _targetCalibrationBpm;
+
+    debugLog(
+        'SensorService: 測定BPM: $measuredBpm, 目標BPM: $_targetCalibrationBpm, 誤差: $error');
 
     // キャリブレーションポイントの追加・更新
     bool updated = false;
@@ -229,6 +329,8 @@ class SensorService {
           error: error,
         );
         updated = true;
+        debugLog(
+            'SensorService: 既存のキャリブレーションポイントを更新しました: BPM = $_targetCalibrationBpm');
         break;
       }
     }
@@ -239,6 +341,8 @@ class SensorService {
         measuredBpm: measuredBpm,
         error: error,
       ));
+      debugLog(
+          'SensorService: 新しいキャリブレーションポイントを追加しました: BPM = $_targetCalibrationBpm');
     }
 
     // 補正係数の計算（線形回帰）
@@ -255,20 +359,22 @@ class SensorService {
     );
 
     _calibrationResultController.add(result);
-
-    debugPrint(
-        'キャリブレーション完了: 目標=$_targetCalibrationBpm, 測定=$measuredBpm, 誤差=$error');
-    debugPrint('補正係数: 乗数=$_calibrationMultiplier, オフセット=$_calibrationOffset');
+    debugLog('SensorService: キャリブレーション結果を送信しました');
+    debugLog(
+        'SensorService: 補正係数: 乗数=$_calibrationMultiplier, オフセット=$_calibrationOffset');
 
     _isCalibrating = false;
   }
 
   // 補正係数の計算（線形回帰）
   void _calculateCalibrationCoefficients() {
+    debugLog('SensorService: 補正係数を計算します: ポイント数 = ${_calibrationPoints.length}');
+
     if (_calibrationPoints.length < 2) {
       // データ不足の場合はデフォルト値を使用
       _calibrationMultiplier = 1.0;
       _calibrationOffset = 0.0;
+      debugLog('SensorService: データ不足のためデフォルト値を使用します');
       return;
     }
 
@@ -292,26 +398,37 @@ class SensorService {
       // 分母がほぼ0の場合
       _calibrationMultiplier = 1.0;
       _calibrationOffset = 0.0;
+      debugLog('SensorService: 分母がゼロに近いためデフォルト値を使用します');
     } else {
       _calibrationMultiplier = (n * sumXY - sumX * sumY) / denominator;
       _calibrationOffset = (sumY - _calibrationMultiplier * sumX) / n;
 
       // 異常値チェック（極端な補正を避ける）
       if (_calibrationMultiplier < 0.5 || _calibrationMultiplier > 2.0) {
-        debugPrint('警告: 異常な補正係数が計算されました。デフォルト値を使用します。');
+        debugLog(
+            'SensorService: 警告: 異常な補正係数が計算されました: $_calibrationMultiplier。デフォルト値を使用します。');
         _calibrationMultiplier = 1.0;
         _calibrationOffset = 0.0;
       }
     }
+
+    debugLog(
+        'SensorService: 計算された補正係数: 乗数=$_calibrationMultiplier, オフセット=$_calibrationOffset');
   }
 
   // 精度の検証
   void verifyAccuracy(double knownBpm) {
-    if (!_isRunning || !_isWalking || _currentBpm <= 0) return;
+    if (!_isRunning || !_isWalking || _currentBpm <= 0) {
+      debugLog('SensorService: 精度検証をスキップします: 歩行データが不足しています');
+      return;
+    }
 
     // 現在の測定値とknownBpmの差を計算
     final error = (_currentBpm - knownBpm).abs();
     final percentError = (error / knownBpm) * 100;
+
+    debugLog(
+        'SensorService: 精度検証: 既知値=$knownBpm, 測定値=$_currentBpm, 誤差=$error (${percentError.toStringAsFixed(1)}%)');
 
     _verificationErrors.add(percentError);
     _verificationCount++;
@@ -331,15 +448,16 @@ class SensorService {
     _currentAccuracy = 100.0 - _avgVerificationError;
     if (_currentAccuracy < 0.0) _currentAccuracy = 0.0;
 
-    debugPrint(
-        '精度検証: 既知=$knownBpm, 測定=$_currentBpm, 誤差=$error (${percentError.toStringAsFixed(1)}%)');
-    debugPrint(
-        '現在の推定精度: ${_currentAccuracy.toStringAsFixed(1)}%, 信頼度: ${(_confidenceLevel * 100).toStringAsFixed(1)}%');
+    debugLog(
+        'SensorService: 現在の推定精度: ${_currentAccuracy.toStringAsFixed(1)}%, 信頼度: ${(_confidenceLevel * 100).toStringAsFixed(1)}%');
   }
 
-  // 加速度データの処理（フィルタリングと歩行リズム検出）
+  // 加速度データの処理（フィルタリングと歩行リズム検出）- 改良版
   void _processAccelerometerData() {
-    if (_recentData.length < 200) return; // 少なくとも4秒分のデータが必要
+    if (_recentData.length < 200) {
+      debugLog('SensorService: データ不足のため処理をスキップします: ${_recentData.length}/200');
+      return;
+    }
 
     try {
       // マグニチュードの抽出
@@ -350,12 +468,16 @@ class SensorService {
 
       if (!isActive) {
         // 活動が検出されない場合、歩行なしと判断
+        if (_isWalking) {
+          debugLog('SensorService: 歩行停止を検出しました');
+        }
         _isWalking = false;
 
         // 歩行なしの場合は0 BPMを送信
         if (_currentBpm != 0.0) {
           _currentBpm = 0.0;
           _gaitRhythmController.add(_currentBpm);
+          debugLog('SensorService: 歩行停止のため、BPM=0を送信しました');
         }
         return;
       }
@@ -379,6 +501,9 @@ class SensorService {
       double detectedBpm = 0.0;
       double totalWeight = 0.0;
 
+      debugLog(
+          'SensorService: 検出結果 - 自己相関法: $autocorrBpm BPM, ピーク検出法: $peakBpm BPM, FFT法: $fftBpm BPM');
+
       // 有効値のみ重み付け
       if (autocorrBpm >= 40 && autocorrBpm <= 160) {
         detectedBpm += autocorrBpm * _autocorrelationWeight;
@@ -398,21 +523,19 @@ class SensorService {
       // 有効な重みがある場合のみ計算
       if (totalWeight > 0) {
         detectedBpm /= totalWeight;
+        debugLog(
+            'SensorService: 重み付け統合BPM: $detectedBpm BPM (合計重み: $totalWeight)');
       } else {
         // すべての方法が失敗した場合
+        debugLog('SensorService: すべての検出方法が失敗しました');
         return;
       }
 
       // 4. キャリブレーション補正の適用
       final calibratedBpm =
           detectedBpm * _calibrationMultiplier + _calibrationOffset;
-
-      // デバッグログ（詳細な検出結果）
-      if (detectedBpm > 0) {
-        debugPrint('BPM検出: 自己相関=$autocorrBpm, ピーク=$peakBpm, FFT=$fftBpm');
-        debugPrint(
-            '統合BPM=$detectedBpm, 補正後=${calibratedBpm.toStringAsFixed(1)}');
-      }
+      debugLog(
+          'SensorService: 補正後BPM: $calibratedBpm BPM (補正前: $detectedBpm BPM)');
 
       // 5. 平滑化（急激な変化を防止）
       _recentBpms.add(calibratedBpm);
@@ -423,18 +546,24 @@ class SensorService {
       // 外れ値の影響を減らすために中央値フィルタリングを使用
       List<double> sortedBpms = List.from(_recentBpms)..sort();
       final smoothedBpm = sortedBpms[sortedBpms.length ~/ 2];
+      debugLog(
+          'SensorService: 平滑化BPM: $smoothedBpm BPM (平滑化前: $calibratedBpm BPM)');
 
       // 歩行状態の更新と通知
-      _isWalking = true;
+      if (!_isWalking) {
+        debugLog('SensorService: 歩行開始を検出しました');
+        _isWalking = true;
+      }
 
       // 前回のBPMと大きく異なる場合のみ更新（ノイズ削減）
       if (_currentBpm == 0.0 || (_currentBpm - smoothedBpm).abs() > 2.0) {
         _currentBpm = smoothedBpm;
         _gaitRhythmController.add(_currentBpm);
+        debugLog('SensorService: BPM値を更新: $_currentBpm BPM');
       }
     } catch (e) {
       // エラーが発生した場合でも継続処理
-      debugPrint('歩行リズム検出エラー: $e');
+      debugLog('SensorService: 歩行リズム検出エラー: $e');
     }
   }
 
@@ -743,10 +872,14 @@ class SensorService {
 
   // リソース解放
   void dispose() {
+    debugLog('SensorService: リソースを解放します');
+
     stopSensing();
     _accelerometerDataController.close();
     _gaitRhythmController.close();
     _calibrationResultController.close();
+
+    debugLog('SensorService: すべてのリソースを解放しました');
   }
 }
 

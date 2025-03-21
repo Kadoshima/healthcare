@@ -7,6 +7,14 @@ import 'dart:math' as math;
 import '../services/sensor_service.dart';
 import '../services/improved_audio_service.dart';
 
+// グローバルなデバッグロギング用（main.dartと合わせる）
+bool debugMode = true;
+void debugLog(String message) {
+  if (debugMode) {
+    print('[DEBUG] $message');
+  }
+}
+
 /// 歩行リズムキャリブレーション画面
 class CalibrationScreen extends StatefulWidget {
   const CalibrationScreen({Key? key}) : super(key: key);
@@ -30,6 +38,10 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
   int _countdownSeconds = 5;
   int _calibrationSeconds = 30;
 
+  // 初期化状態
+  bool _isInitializing = true;
+  String _initError = '';
+
   // 結果表示用
   List<CalibrationPoint> _calibrationPoints = [];
   double _calibrationMultiplier = 1.0;
@@ -46,47 +58,101 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
   @override
   void initState() {
     super.initState();
+    debugLog('キャリブレーション画面を初期化します');
 
-    // サービスの取得
-    _sensorService = Provider.of<SensorService>(context, listen: false);
-    _audioService = Provider.of<ImprovedAudioService>(context, listen: false);
+    // サービスの取得と初期化
+    _initializeServices();
+  }
 
-    // オーディオサービスの初期化
-    _audioService.initialize().then((_) {
-      // センサーサービスの初期化
-      _sensorService.initialize().then((_) {
-        // キャリブレーション結果の購読
-        _calibrationResultSubscription = _sensorService.calibrationResultStream
-            .listen(_handleCalibrationResult);
-
-        // BPMデータの購読
-        _bpmSubscription =
-            _sensorService.gaitRhythmStream.listen(_handleBpmUpdate);
-
-        // センサー開始
-        _sensorService.startSensing();
-
-        // 準備完了
-        setState(() {
-          _currentCalibrationStep = -1;
-        });
-      });
+  // サービスの初期化
+  Future<void> _initializeServices() async {
+    setState(() {
+      _isInitializing = true;
+      _initError = '';
     });
+
+    try {
+      // サービスの取得
+      _sensorService = Provider.of<SensorService>(context, listen: false);
+      _audioService = Provider.of<ImprovedAudioService>(context, listen: false);
+
+      debugLog('オーディオサービスの初期化を開始します');
+
+      // オーディオサービスの初期化
+      bool audioInitialized = await _audioService.initialize();
+      if (!audioInitialized) {
+        throw Exception('オーディオサービスの初期化に失敗しました');
+      }
+
+      debugLog('オーディオサービスの初期化が完了しました');
+
+      // 高精度モードを設定
+      _audioService.setPrecisionMode(PrecisionMode.highPrecision);
+
+      // 標準クリック音のロード
+      bool soundLoaded = await _audioService.loadClickSound('標準クリック');
+      if (!soundLoaded) {
+        throw Exception('標準クリック音のロードに失敗しました');
+      }
+
+      debugLog('センサーサービスの初期化を開始します');
+
+      // センサーサービスの初期化
+      bool sensorInitialized = await _sensorService.initialize();
+      if (!sensorInitialized) {
+        throw Exception('センサーサービスの初期化に失敗しました');
+      }
+
+      debugLog('センサーサービスの初期化が完了しました');
+
+      // キャリブレーション結果の購読
+      _calibrationResultSubscription = _sensorService.calibrationResultStream
+          .listen(_handleCalibrationResult);
+
+      // BPMデータの購読
+      _bpmSubscription =
+          _sensorService.gaitRhythmStream.listen(_handleBpmUpdate);
+
+      // センサー開始
+      _sensorService.startSensing();
+      debugLog('センサーの起動が完了しました');
+
+      // 準備完了
+      setState(() {
+        _currentCalibrationStep = -1;
+        _isInitializing = false;
+      });
+
+      debugLog('キャリブレーション画面の初期化が完了しました');
+    } catch (e) {
+      debugLog('初期化エラー: $e');
+      setState(() {
+        _isInitializing = false;
+        _initError = e.toString();
+      });
+
+      // エラー表示
+      _showError('初期化エラー', e.toString());
+    }
   }
 
   @override
   void dispose() {
+    debugLog('キャリブレーション画面のリソースを解放します');
+
     // タイマーのキャンセル
     _calibrationTimer?.cancel();
 
     // メトロノームの停止
     if (_isPlaying) {
       _audioService.stopTempoCues();
+      debugLog('メトロノームを停止しました');
     }
 
     // 購読のキャンセル
     _bpmSubscription?.cancel();
     _calibrationResultSubscription?.cancel();
+    debugLog('購読をキャンセルしました');
 
     super.dispose();
   }
@@ -98,11 +164,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
         _currentCalibrationStep < _calibrationBpms.length) {
       // 現在のBPMを表示用に更新
       setState(() {});
+      debugLog('BPM更新: $bpm');
     }
   }
 
   // キャリブレーション結果のハンドラ
   void _handleCalibrationResult(CalibrationResult result) {
+    debugLog('キャリブレーション結果を受信しました: '
+        'targetBpm=${result.targetBpm}, measuredBpm=${result.measuredBpm}, '
+        'error=${result.error}, multiplier=${result.calibrationMultiplier}, '
+        'offset=${result.calibrationOffset}');
+
     setState(() {
       _calibrationPoints = result.points;
       _calibrationMultiplier = result.calibrationMultiplier;
@@ -117,6 +189,8 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
   void _startCalibration() {
     if (_currentCalibrationStep >= 0) return; // 既に開始している場合
 
+    debugLog('キャリブレーションを開始します');
+
     setState(() {
       _currentCalibrationStep = 0;
       _countdownSeconds = 5;
@@ -130,12 +204,15 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
   void _startCountdown() {
     _calibrationTimer?.cancel();
 
+    debugLog('カウントダウンを開始します: $_countdownSeconds秒');
+
     _calibrationTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
       setState(() {
         _countdownSeconds--;
       });
 
       if (_countdownSeconds <= 0) {
+        debugLog('カウントダウンが完了しました');
         timer.cancel();
         _startCalibrationStep();
       }
@@ -146,20 +223,20 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
   void _startCalibrationStep() {
     if (_currentCalibrationStep >= _calibrationBpms.length) {
       // すべてのステップが完了
+      debugLog('すべてのキャリブレーションステップが完了しました');
       _completeCalibration();
       return;
     }
 
     final targetBpm = _calibrationBpms[_currentCalibrationStep];
+    debugLog('キャリブレーションステップ $_currentCalibrationStep を開始します: BPM = $targetBpm');
 
     // メトロノーム開始
-    _audioService.loadClickSound('標準クリック').then((_) {
-      _audioService.startTempoCues(targetBpm);
-      _isPlaying = true;
-    });
+    _loadAndStartMetronome(targetBpm);
 
     // キャリブレーション開始
     _sensorService.startCalibration(targetBpm);
+    debugLog('センサーキャリブレーションを開始しました: BPM = $targetBpm');
 
     // キャリブレーションタイマー設定
     _calibrationSeconds = 30;
@@ -170,20 +247,58 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
       });
 
       if (_calibrationSeconds <= 0) {
+        debugLog('キャリブレーションタイマーが完了しました');
         timer.cancel();
         _finishCurrentStep();
       }
     });
   }
 
+  // メトロノームのロードと開始
+  Future<void> _loadAndStartMetronome(double targetBpm) async {
+    try {
+      // まず明示的にクリック音をロード
+      bool soundLoaded = await _audioService.loadClickSound('標準クリック');
+      if (!soundLoaded) {
+        debugLog('クリック音のロードに失敗しました');
+        _showError('サウンドエラー', 'クリック音のロードに失敗しました');
+        return;
+      }
+
+      debugLog('クリック音のロードに成功しました');
+
+      // メトロノーム開始
+      _audioService.startTempoCues(targetBpm);
+      setState(() {
+        _isPlaying = true;
+      });
+
+      debugLog('メトロノームを開始しました: BPM = $targetBpm');
+    } catch (e) {
+      debugLog('メトロノーム開始エラー: $e');
+      _showError('メトロノームエラー', 'メトロノームの開始に失敗しました: $e');
+
+      // エラーが発生した場合でもキャリブレーションは続行
+      setState(() {
+        _isPlaying = false;
+      });
+    }
+  }
+
   // 現在のキャリブレーションステップを終了
   void _finishCurrentStep() {
+    debugLog('キャリブレーションステップを終了します: ステップ $_currentCalibrationStep');
+
     // メトロノーム停止
     _audioService.stopTempoCues();
-    _isPlaying = false;
+    setState(() {
+      _isPlaying = false;
+    });
+    debugLog('メトロノームを停止しました');
 
     // キャリブレーションデータ収集終了
     _sensorService.stopCalibration();
+    debugLog('センサーキャリブレーションを停止しました');
 
     // 次のステップへ
     setState(() {
@@ -192,9 +307,11 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
     });
 
     if (_currentCalibrationStep < _calibrationBpms.length) {
+      debugLog('次のキャリブレーションステップへ進みます: ステップ $_currentCalibrationStep');
       // 次のステップのカウントダウン開始
       _startCountdown();
     } else {
+      debugLog('すべてのキャリブレーションステップが完了しました');
       // すべてのステップが完了
       _completeCalibration();
     }
@@ -202,12 +319,20 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
 
   // キャリブレーション完了
   void _completeCalibration() {
+    debugLog('キャリブレーションを完了します');
+
     setState(() {
       _currentCalibrationStep = _calibrationBpms.length; // 完了状態
     });
 
     // グラフデータの更新
     _updateGraphData();
+
+    // 結果をログに出力
+    debugLog('キャリブレーション結果: '
+        'ポイント数=${_calibrationPoints.length}, '
+        '補正乗数=$_calibrationMultiplier, '
+        '補正オフセット=$_calibrationOffset');
   }
 
   // グラフデータの更新
@@ -239,18 +364,24 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
 
   // キャリブレーションステップをスキップ
   void _skipStep() {
+    debugLog('キャリブレーションステップをスキップします: ステップ $_currentCalibrationStep');
+
     _calibrationTimer?.cancel();
 
     // メトロノーム停止
     if (_isPlaying) {
       _audioService.stopTempoCues();
-      _isPlaying = false;
+      setState(() {
+        _isPlaying = false;
+      });
+      debugLog('メトロノームを停止しました（スキップ）');
     }
 
     // キャリブレーション停止
     if (_currentCalibrationStep >= 0 &&
         _currentCalibrationStep < _calibrationBpms.length) {
       _sensorService.stopCalibration();
+      debugLog('センサーキャリブレーションを停止しました（スキップ）');
     }
 
     // 次のステップへ
@@ -260,9 +391,11 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
     });
 
     if (_currentCalibrationStep < _calibrationBpms.length) {
+      debugLog('次のキャリブレーションステップへ進みます（スキップ後）: ステップ $_currentCalibrationStep');
       // 次のステップのカウントダウン開始
       _startCountdown();
     } else {
+      debugLog('すべてのキャリブレーションステップが完了しました（スキップ後）');
       // すべてのステップが完了
       _completeCalibration();
     }
@@ -270,12 +403,17 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
 
   // キャリブレーションをリセット
   void _resetCalibration() {
+    debugLog('キャリブレーションをリセットします');
+
     _calibrationTimer?.cancel();
 
     // メトロノーム停止
     if (_isPlaying) {
       _audioService.stopTempoCues();
-      _isPlaying = false;
+      setState(() {
+        _isPlaying = false;
+      });
+      debugLog('メトロノームを停止しました（リセット）');
     }
 
     setState(() {
@@ -283,6 +421,54 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
       _countdownSeconds = 5;
       _calibrationSeconds = 30;
     });
+
+    debugLog('キャリブレーションをリセットしました: 準備完了状態');
+  }
+
+  // エラー表示
+  void _showError(String title, String message) {
+    debugLog('エラー表示: $title - $message');
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$title: $message'),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 5),
+        action: SnackBarAction(
+          label: '閉じる',
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+        ),
+      ),
+    );
+  }
+
+  // 読み込み中の表示
+  Widget _buildLoadingScreen() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 20),
+          const Text('キャリブレーションを準備中...', style: TextStyle(fontSize: 18)),
+          if (_initError.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            Text(
+              'エラー: $_initError',
+              style: const TextStyle(color: Colors.red),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton(
+              onPressed: _initializeServices,
+              child: const Text('再試行'),
+            ),
+          ],
+        ],
+      ),
+    );
   }
 
   @override
@@ -299,121 +485,125 @@ class _CalibrationScreenState extends State<CalibrationScreen> {
         ],
       ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // 説明カード
-              Card(
-                elevation: 4,
-                child: Padding(
-                  padding: const EdgeInsets.all(16.0),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
+        child: _isInitializing
+            ? _buildLoadingScreen()
+            : Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // 説明カード
+                    Card(
+                      elevation: 4,
+                      child: Padding(
+                        padding: const EdgeInsets.all(16.0),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'キャリブレーション手順',
+                              style: TextStyle(
+                                fontSize: 18,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            const SizedBox(height: 8),
+                            const Text(
+                              '1. メトロノーム音に合わせて歩きます\n'
+                              '2. 各BPM（80, 100, 120）で30秒間歩行します\n'
+                              '3. キャリブレーション結果が自動的に適用されます',
+                            ),
+                            const SizedBox(height: 8),
+                            const Text(
+                              '正確なキャリブレーションのため、メトロノームの音に合わせて一定のリズムで歩いてください。',
+                              style: TextStyle(
+                                fontStyle: FontStyle.italic,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // ステータス表示
+                    _buildStatusCard(),
+
+                    const SizedBox(height: 16),
+
+                    // キャリブレーションボタン
+                    Center(
+                      child: _currentCalibrationStep == -1
+                          ? ElevatedButton.icon(
+                              icon: const Icon(Icons.play_arrow),
+                              label: const Text('キャリブレーション開始'),
+                              style: ElevatedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 32,
+                                  vertical: 16,
+                                ),
+                              ),
+                              onPressed: _startCalibration,
+                            )
+                          : Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                if (_currentCalibrationStep <
+                                    _calibrationBpms.length)
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.skip_next),
+                                    label: const Text('スキップ'),
+                                    onPressed: _skipStep,
+                                  ),
+                                const SizedBox(width: 16),
+                                if (_currentCalibrationStep ==
+                                    _calibrationBpms.length)
+                                  ElevatedButton.icon(
+                                    icon: const Icon(Icons.done),
+                                    label: const Text('完了'),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.green,
+                                      foregroundColor: Colors.white,
+                                    ),
+                                    onPressed: () =>
+                                        Navigator.of(context).pop(),
+                                  ),
+                              ],
+                            ),
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // 結果表示
+                    if (_calibrationPoints.isNotEmpty) ...[
                       const Text(
-                        'キャリブレーション手順',
+                        'キャリブレーション結果',
                         style: TextStyle(
                           fontSize: 18,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
+
                       const SizedBox(height: 8),
-                      const Text(
-                        '1. メトロノーム音に合わせて歩きます\n'
-                        '2. 各BPM（80, 100, 120）で30秒間歩行します\n'
-                        '3. キャリブレーション結果が自動的に適用されます',
-                      ),
-                      const SizedBox(height: 8),
-                      const Text(
-                        '正確なキャリブレーションのため、メトロノームの音に合わせて一定のリズムで歩いてください。',
-                        style: TextStyle(
-                          fontStyle: FontStyle.italic,
-                          color: Colors.grey,
+
+                      // 結果グラフ
+                      _buildCalibrationGraph(),
+
+                      const SizedBox(height: 16),
+
+                      // 補正係数
+                      Text(
+                        '補正係数: ${_calibrationMultiplier.toStringAsFixed(3)} × BPM + ${_calibrationOffset.toStringAsFixed(2)}',
+                        style: const TextStyle(
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
                     ],
-                  ),
+                  ],
                 ),
               ),
-
-              const SizedBox(height: 16),
-
-              // ステータス表示
-              _buildStatusCard(),
-
-              const SizedBox(height: 16),
-
-              // キャリブレーションボタン
-              Center(
-                child: _currentCalibrationStep == -1
-                    ? ElevatedButton.icon(
-                        icon: const Icon(Icons.play_arrow),
-                        label: const Text('キャリブレーション開始'),
-                        style: ElevatedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 32,
-                            vertical: 16,
-                          ),
-                        ),
-                        onPressed: _startCalibration,
-                      )
-                    : Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          if (_currentCalibrationStep < _calibrationBpms.length)
-                            ElevatedButton.icon(
-                              icon: const Icon(Icons.skip_next),
-                              label: const Text('スキップ'),
-                              onPressed: _skipStep,
-                            ),
-                          const SizedBox(width: 16),
-                          if (_currentCalibrationStep ==
-                              _calibrationBpms.length)
-                            ElevatedButton.icon(
-                              icon: const Icon(Icons.done),
-                              label: const Text('完了'),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.green,
-                                foregroundColor: Colors.white,
-                              ),
-                              onPressed: () => Navigator.of(context).pop(),
-                            ),
-                        ],
-                      ),
-              ),
-
-              const SizedBox(height: 24),
-
-              // 結果表示
-              if (_calibrationPoints.isNotEmpty) ...[
-                const Text(
-                  'キャリブレーション結果',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-
-                const SizedBox(height: 8),
-
-                // 結果グラフ
-                _buildCalibrationGraph(),
-
-                const SizedBox(height: 16),
-
-                // 補正係数
-                Text(
-                  '補正係数: ${_calibrationMultiplier.toStringAsFixed(3)} × BPM + ${_calibrationOffset.toStringAsFixed(2)}',
-                  style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ],
-          ),
-        ),
       ),
     );
   }
