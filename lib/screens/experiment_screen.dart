@@ -708,6 +708,7 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
             .clamp(0, double.infinity);
     final double maxY =
         dataPoints.map((p) => p.y).reduce((a, b) => a > b ? a : b) + 10;
+    final double maxX = dataPoints.last.x + 0.5; // グラフの右端に余白を追加
 
     return Card(
       elevation: 4,
@@ -719,11 +720,13 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
           children: [
             Row(
               children: [
-                const Icon(Icons.show_chart, size: 20),
+                const Icon(Icons.show_chart, size: 20, color: Colors.blue),
                 const SizedBox(width: 8),
                 Text(
                   '歩行リズム推移',
-                  style: Theme.of(context).textTheme.titleMedium,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
                 ),
               ],
             ),
@@ -735,7 +738,7 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
                   gridData: FlGridData(
                     show: true,
                     drawVerticalLine: true,
-                    horizontalInterval: 20,
+                    horizontalInterval: 10,
                     getDrawingHorizontalLine: (value) {
                       return FlLine(
                         color: Colors.grey.withOpacity(0.3),
@@ -744,7 +747,7 @@ class _ExperimentScreenState extends State<ExperimentScreen> {
                     },
                     getDrawingVerticalLine: (value) {
                       return FlLine(
-                        color: Colors.grey.withOpacity(0.3),
+                        color: Colors.grey.withOpacity(0.2),
                         strokeWidth: 1,
                       );
                     },

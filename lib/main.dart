@@ -35,6 +35,11 @@ void debugLog(String message) {
   }
 }
 
+// グローバルインスタンス（アプリ全体でアクセス可能）
+// これにより、画面間でのデータ共有が確実になります
+final SensorService globalSensorService = SensorService();
+final ImprovedAudioService globalAudioService = ImprovedAudioService();
+
 void main() async {
   // Flutter初期化を確実に実行
   WidgetsFlutterBinding.ensureInitialized();
@@ -62,6 +67,11 @@ void main() async {
   await databaseService.initialize();
   debugLog('データベースサービスを初期化しました');
 
+  // グローバルサービスの初期化
+  await globalSensorService.initialize();
+  await globalAudioService.initialize();
+  debugLog('グローバルサービスを初期化しました');
+
   // Azure Storage設定
   final azureStorageService = AzureStorageService(
     accountName: 'hagiharatest', // 実際のAzureアカウント名
@@ -83,9 +93,9 @@ void main() async {
           update: (_, databaseService, __) =>
               ExperimentService(databaseService),
         ),
-        Provider<SensorService>(
-            create: (_) => SensorService()), // 改良版SensorService
-        Provider<ImprovedAudioService>(create: (_) => ImprovedAudioService()),
+        // グローバルインスタンスを提供
+        Provider<SensorService>.value(value: globalSensorService),
+        Provider<ImprovedAudioService>.value(value: globalAudioService),
         Provider<AzureStorageService>.value(value: azureStorageService),
       ],
       child: const WalkingRhythmApp(),
@@ -116,45 +126,57 @@ class _WalkingRhythmAppState extends State<WalkingRhythmApp> {
   void initState() {
     super.initState();
 
-    // 各サービスの非同期初期化処理
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _initializeServices();
-    });
+    // グローバルサービスはすでに初期化されているので、
+    // 状態を確認するだけで良い
+    _checkServiceStatus();
   }
 
-  // サービスの初期化（改善版）
+  // サービスの状態確認
+  void _checkServiceStatus() {
+    setState(() {
+      _servicesInitialized =
+          globalSensorService.isInitialized && globalAudioService.isInitialized;
+      _initializationError = '';
+    });
+
+    if (!_servicesInitialized) {
+      _initializeServices();
+    }
+  }
+
+  // サービスの初期化（必要な場合のみ）
   Future<void> _initializeServices() async {
     try {
       debugLog('サービスの初期化を開始します');
 
-      // ImprovedAudioServiceの初期化
-      final improvedAudioService =
-          Provider.of<ImprovedAudioService>(context, listen: false);
-      bool audioInitialized = await improvedAudioService.initialize();
-
-      if (!audioInitialized) {
-        throw Exception("オーディオサービスの初期化に失敗しました");
+      // SensorServiceの初期化が必要な場合
+      if (!globalSensorService.isInitialized) {
+        bool sensorInitialized = await globalSensorService.initialize();
+        if (!sensorInitialized) {
+          throw Exception("センサーサービスの初期化に失敗しました");
+        }
+        debugLog('センサーサービスを初期化しました');
       }
-      debugLog('オーディオサービスを初期化しました');
 
-      // 高精度モードを設定
-      improvedAudioService.setPrecisionMode(PrecisionMode.highPrecision);
-      debugLog('オーディオサービスを高精度モードに設定しました');
+      // ImprovedAudioServiceの初期化が必要な場合
+      if (!globalAudioService.isInitialized) {
+        bool audioInitialized = await globalAudioService.initialize();
+        if (!audioInitialized) {
+          throw Exception("オーディオサービスの初期化に失敗しました");
+        }
+        debugLog('オーディオサービスを初期化しました');
 
-      // 標準のクリック音を設定
-      bool soundLoaded = await improvedAudioService.loadClickSound('標準クリック');
-      if (!soundLoaded) {
-        throw Exception("クリック音のロードに失敗しました");
+        // 高精度モードを設定
+        globalAudioService.setPrecisionMode(PrecisionMode.highPrecision);
+        debugLog('オーディオサービスを高精度モードに設定しました');
+
+        // 標準のクリック音を設定
+        bool soundLoaded = await globalAudioService.loadClickSound('標準クリック');
+        if (!soundLoaded) {
+          throw Exception("クリック音のロードに失敗しました");
+        }
+        debugLog('標準クリック音をロードしました');
       }
-      debugLog('標準クリック音をロードしました');
-
-      // SensorServiceの初期化
-      final sensorService = Provider.of<SensorService>(context, listen: false);
-      bool sensorInitialized = await sensorService.initialize();
-      if (!sensorInitialized) {
-        throw Exception("センサーサービスの初期化に失敗しました");
-      }
-      debugLog('センサーサービスを初期化しました');
 
       // 初期化完了を設定
       setState(() {

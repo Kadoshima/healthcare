@@ -3,9 +3,11 @@ import 'package:provider/provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../models/experiment_settings.dart';
+import '../services/sensor_service.dart'; // SensorService をインポート
 import 'experiment_screen.dart';
 import 'researcher_dashboard.dart';
 import 'experiment_history_screen.dart';
+import 'calibration_screen.dart'; // キャリブレーション画面をインポート
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({Key? key}) : super(key: key);
@@ -28,10 +30,14 @@ class _HomeScreenState extends State<HomeScreen> {
   // 権限状態
   bool _hasPermissions = false;
 
+  // キャリブレーション状態を追跡
+  bool _isCalibrated = false;
+
   @override
   void initState() {
     super.initState();
     _checkPermissions();
+    _checkCalibrationStatus();
 
     // フォーカスを強制的に解除し、キーボードを非表示にする
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -45,6 +51,17 @@ class _HomeScreenState extends State<HomeScreen> {
     final storageStatus = await Permission.storage.status;
     setState(() {
       _hasPermissions = storageStatus.isGranted;
+    });
+  }
+
+  // キャリブレーション状態のチェック
+  void _checkCalibrationStatus() {
+    // SensorServiceのキャリブレーション状態を確認
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final sensorService = Provider.of<SensorService>(context, listen: false);
+      setState(() {
+        _isCalibrated = sensorService.calibrationPoints.isNotEmpty;
+      });
     });
   }
 
@@ -122,6 +139,68 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                     ),
+
+                  const SizedBox(height: 16),
+
+                  // キャリブレーション状態表示とボタン
+                  Card(
+                    color: _isCalibrated
+                        ? Colors.green.shade50
+                        : Colors.amber.shade50,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(
+                                _isCalibrated
+                                    ? Icons.check_circle
+                                    : Icons.warning,
+                                color:
+                                    _isCalibrated ? Colors.green : Colors.amber,
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                'センサーキャリブレーション',
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .titleMedium
+                                    ?.copyWith(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            _isCalibrated
+                                ? 'センサーはキャリブレーション済みです。必要に応じて再キャリブレーションを行ってください。'
+                                : '高精度な測定のため、実験前にセンサーのキャリブレーションを行ってください。',
+                          ),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.tune),
+                              label: Text(_isCalibrated
+                                  ? 'センサーを再キャリブレーション'
+                                  : 'センサーをキャリブレーション'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor:
+                                    _isCalibrated ? Colors.green : Colors.amber,
+                                foregroundColor: Colors.white,
+                              ),
+                              onPressed: () {
+                                _navigateToCalibration(context);
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
 
                   const SizedBox(height: 16),
 
@@ -358,6 +437,20 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+  }
+
+  // キャリブレーション画面への遷移
+  Future<void> _navigateToCalibration(BuildContext context) async {
+    final result = await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => const CalibrationScreen(),
+      ),
+    );
+
+    // キャリブレーション画面から戻ってきたら状態を更新
+    if (mounted) {
+      _checkCalibrationStatus();
+    }
   }
 
   // 実験開始

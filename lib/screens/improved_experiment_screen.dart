@@ -1,10 +1,19 @@
 import 'dart:async';
-import 'dart:math';
-import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
-import 'dart:io' show Platform;
+import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'package:fl_chart/fl_chart.dart';
 
-// グローバルなデバッグロギング用（main.dartと合わせる）
+import '../models/experiment_settings.dart';
+import '../models/gait_data.dart';
+import '../services/sensor_service.dart';
+import '../services/improved_audio_service.dart';
+import '../services/experiment_service.dart';
+import '../widgets/phase_timer.dart';
+import '../widgets/tempo_display.dart';
+import 'calibration_screen.dart';
+import 'results_screen.dart';
+
+// Global debug logging
 bool debugMode = true;
 void debugLog(String message) {
   if (debugMode) {
@@ -12,984 +21,1057 @@ void debugLog(String message) {
   }
 }
 
-// 精度モードの列挙型
-enum PrecisionMode { basic, highPrecision, synthesized }
+class ImprovedExperimentScreen extends StatefulWidget {
+  const ImprovedExperimentScreen({Key? key}) : super(key: key);
 
-// 波形の種類
-enum WaveformType { sine, square, triangle, sawtooth }
+  @override
+  State<ImprovedExperimentScreen> createState() =>
+      _ImprovedExperimentScreenState();
+}
 
-// 改良版オーディオサービス
-class ImprovedAudioService {
-  // ネイティブ通信用チャンネル
-  static const MethodChannel _nativeChannel =
-      MethodChannel('com.example.healthcare_app_1/metronome');
+class _ImprovedExperimentScreenState extends State<ImprovedExperimentScreen> {
+  // Services
+  late SensorService _sensorService;
+  late ImprovedAudioService _audioService;
+  late ExperimentService _experimentService;
 
-  // 再生状態
-  bool _isPlaying = false;
-  double _currentTempo = 100.0; // BPM
-  String _currentSoundType = '標準クリック';
-  double _volume = 0.7;
-  Timer? _clickTimer;
-  Timer? _schedulerTimer; // スケジューラタイマー
-  bool _isInitialized = false;
-  bool _previewMode = false;
-  int _errorCount = 0;
+  // Subscriptions
+  StreamSubscription<double>? _gaitRhythmSubscription;
+  StreamSubscription<GaitRhythmData>? _gaitDataSubscription;
 
-  // 高精度モード用
-  Stopwatch? _stopwatch;
-  int _nextTickTime = 0;
-  int _tickCount = 0;
-  bool _preloadedBufferAvailable = false;
+  // State
+  double _currentBpm = 0.0;
+  double _targetBpm = 0.0;
+  final List<FlSpot> _rhythmDataPoints = [];
+  final int _maxDataPoints = 100; // Number of data points for graph display
 
-  // 精度モード
-  PrecisionMode _precisionMode = PrecisionMode.highPrecision;
+  // Initialization state
+  bool _isInitializing = true;
+  String _initError = '';
+  bool _servicesReady = false;
 
-  // オーディオキューイング用
-  final List<int> _scheduledBeeps = []; // 予定されたビープ音のタイムスタンプ
-  final int _lookAheadMs = 500; // 500ms先までのビープ音をスケジュール
+  // Session ID
+  int? _sessionId;
 
-  // 診断用
-  int _missedBeeps = 0;
-  int _totalBeeps = 0;
-  DateTime? _lastActualBeepTime;
-  double _avgBeepDelay = 0.0;
-  bool _isInDiagnosticMode = false;
-  late StreamController<int> _testTimestampController;
+  @override
+  void initState() {
+    super.initState();
+    debugLog('Initializing experiment screen');
 
-  // 公開プロパティ
-  bool get isPlaying => _isPlaying;
-  double get currentTempo => _currentTempo;
-  String get currentSoundType => _currentSoundType;
-  PrecisionMode get precisionMode => _precisionMode;
-  bool get isInitialized => _isInitialized;
+    // Initialize services
+    _initializeServices();
+  }
 
-  // 音のプリセット
-  final Map<String, Map<String, dynamic>> _soundPresets = {
-    '標準クリック': {
-      'frequency': 800.0,
-      'duration': 0.02,
-      'waveform': WaveformType.sine,
-    },
-    '柔らかいクリック': {
-      'frequency': 600.0,
-      'duration': 0.03,
-      'waveform': WaveformType.sine,
-    },
-    '木製クリック': {
-      'frequency': 1200.0,
-      'duration': 0.01,
-      'waveform': WaveformType.square,
-    },
-    'ハイクリック': {
-      'frequency': 1600.0,
-      'duration': 0.015,
-      'waveform': WaveformType.sine,
-    },
-  };
-
-  // イニシャライザ - 改善版
-  Future<bool> initialize() async {
-    debugLog('ImprovedAudioService: 初期化を開始します');
-
-    // 既に初期化済みなら成功を返す
-    if (_isInitialized) {
-      debugLog('ImprovedAudioService: 既に初期化済みです');
-      return true;
-    }
+  // Initialize services and check calibration
+  Future<void> _initializeServices() async {
+    setState(() {
+      _isInitializing = true;
+      _initError = '';
+    });
 
     try {
-      // モバイルプラットフォームの場合のみネイティブコードをチェック
-      if (Platform.isIOS || Platform.isAndroid) {
-        debugLog('ImprovedAudioService: モバイルプラットフォームで、ネイティブコードの利用可否を確認します');
+      // Get services
+      _sensorService = Provider.of<SensorService>(context, listen: false);
+      _audioService = Provider.of<ImprovedAudioService>(context, listen: false);
+      _experimentService =
+          Provider.of<ExperimentService>(context, listen: false);
 
-        // ネイティブコード側が利用可能か確認
-        bool? isAvailable;
-        try {
-          isAvailable = await _nativeChannel.invokeMethod<bool>('isAvailable');
-          debugLog('ImprovedAudioService: ネイティブコード利用可否: $isAvailable');
-        } catch (e) {
-          debugLog('ImprovedAudioService: ネイティブコード利用可否チェックでエラー: $e');
-          // エラー発生時はネイティブコードは利用不可として続行
-          isAvailable = false;
-        }
+      debugLog('Initializing audio service');
 
-        if (isAvailable == true) {
-          try {
-            // ネイティブ側で音をプリロード
-            await _nativeChannel.invokeMethod('preloadSounds');
-            _preloadedBufferAvailable = true;
-            debugLog('ImprovedAudioService: ネイティブコードでサウンドをプリロードしました');
-          } catch (e) {
-            debugLog('ImprovedAudioService: ネイティブコードでのサウンドプリロードに失敗: $e');
-            _preloadedBufferAvailable = false;
-          }
-        } else {
-          _preloadedBufferAvailable = false;
-          debugLog('ImprovedAudioService: ネイティブコードが利用できないため、フォールバックモードで動作します');
-        }
-      } else {
-        debugLog('ImprovedAudioService: モバイル以外のプラットフォームではネイティブコードは使用しません');
-        _preloadedBufferAvailable = false;
+      // Initialize audio service
+      bool audioInitialized = await _audioService.initialize();
+      if (!audioInitialized) {
+        throw Exception('Failed to initialize audio service');
       }
 
-      _isInitialized = true;
-      debugLog('ImprovedAudioService: 初期化成功');
-      return true;
-    } catch (e) {
-      debugLog('ImprovedAudioService: 初期化エラー: $e');
-      _isInitialized = false;
-      return false;
-    }
-  }
+      debugLog('Audio service initialized');
 
-  // エラー設定
-  void _setError(String message) {
-    _hasError = true;
-    _lastErrorMessage = message;
-    debugLog('ImprovedAudioService: エラー: $message');
-  }
-
-  // エラーリセット
-  void _resetError() {
-    _hasError = false;
-    _lastErrorMessage = '';
-  }
-
-  // エラー状態の追跡
-  bool _hasError = false;
-  String _lastErrorMessage = '';
-
-  // クリック音ロード - 改良版
-  Future<bool> loadClickSound(String soundType) async {
-    debugLog('ImprovedAudioService: クリック音"$soundType"のロードを開始します');
-
-    try {
-      _resetError();
-
-      // サウンドタイプの検証
-      if (!_soundPresets.containsKey(soundType)) {
-        debugLog('ImprovedAudioService: 未知のサウンドタイプ: $soundType、標準クリックを使用します');
-        soundType = '標準クリック';
+      // Initialize sensor service
+      debugLog('Initializing sensor service');
+      bool sensorInitialized = await _sensorService.initialize();
+      if (!sensorInitialized) {
+        throw Exception('Failed to initialize sensor service');
       }
 
-      _currentSoundType = soundType;
-      final presetData = _soundPresets[soundType]!;
+      debugLog('Sensor service initialized');
 
-      // ネイティブコード側が利用可能であればプリロード
-      if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-        try {
-          await _nativeChannel.invokeMethod('preloadAudio', {
-            'frequency': presetData['frequency'],
-            'duration': presetData['duration'],
-            'waveform': presetData['waveform'].index,
-          });
-          debugLog('ImprovedAudioService: ネイティブコードでサウンドをプリロードしました');
-        } catch (e) {
-          debugLog('ImprovedAudioService: ネイティブコードでのサウンドプリロードに失敗: $e');
-          // エラーがあっても続行（システムサウンドにフォールバック）
-        }
-      } else {
-        debugLog('ImprovedAudioService: システムサウンドを使用します');
-      }
-
-      debugLog('ImprovedAudioService: クリック音"$soundType"のロードが完了しました');
-      return true;
-    } catch (e) {
-      _setError('クリック音ロードエラー: $e');
-      return false;
-    }
-  }
-
-  // プレビューモードの設定
-  void setPreviewMode(bool enabled) {
-    _previewMode = enabled;
-    debugLog('ImprovedAudioService: プレビューモードを${enabled ? "有効" : "無効"}にしました');
-  }
-
-  // ビープ音の再生 - 改良版
-  Future<void> _playBeep({int? scheduledTime}) async {
-    try {
-      final now = DateTime.now().millisecondsSinceEpoch;
-      _totalBeeps++;
-
-      // 診断モードの場合、タイムスタンプを記録
-      if (_isInDiagnosticMode && scheduledTime != null) {
-        _testTimestampController.add(now);
-      }
-
-      // 実際のビープ時間と予定時間との差を記録（診断用）
-      if (scheduledTime != null) {
-        final delay = now - scheduledTime;
-        if (delay > 20) {
-          // 20ms以上の遅延をカウント
-          _missedBeeps++;
-        }
-
-        // 平均遅延を更新
-        _avgBeepDelay =
-            (_avgBeepDelay * (_totalBeeps - 1) + delay) / _totalBeeps;
-
-        if (_totalBeeps % 50 == 0 && kDebugMode) {
-          debugLog(
-              '診断: ${_missedBeeps}/${_totalBeeps} ビープが遅延 (平均: ${_avgBeepDelay.toStringAsFixed(2)}ms)');
-        }
-      }
-
-      _lastActualBeepTime = DateTime.now();
-
-      // ネイティブコード側が利用可能でプリロード済みの場合
-      if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-        try {
-          await _nativeChannel.invokeMethod('playPreloadedAudio', {
-            'volume': _volume,
-          });
-          return;
-        } catch (e) {
-          debugLog(
-              'ImprovedAudioService: ネイティブオーディオ再生に失敗、システムサウンドにフォールバック: $e');
-          // フォールバック（システムサウンド）
-        }
-      }
-
-      // システムサウンドを再生
-      await _playSystemSound();
-
-      // 触覚フィードバックを追加（オプション）
-      if (_volume > 0.5) {
-        await HapticFeedback.lightImpact();
-      }
-    } catch (e) {
-      debugLog('ImprovedAudioService: ビープ音再生エラー: $e');
-
-      // エラーが続く場合は再初期化を試みる
-      if (_errorCount++ > 5) {
-        _reinitializeAudio();
-        _errorCount = 0;
-      }
-    }
-  }
-
-  // オーディオの再初期化
-  Future<void> _reinitializeAudio() async {
-    debugLog('ImprovedAudioService: オーディオシステムを再初期化しています...');
-
-    // 一時停止
-    final wasPlaying = _isPlaying;
-    final currentTempo = _currentTempo;
-
-    stopTempoCues();
-    _isInitialized = false;
-
-    // 再初期化
-    final success = await initialize();
-
-    // 再開
-    if (success && wasPlaying) {
-      startTempoCues(currentTempo);
-    }
-  }
-
-  // システムサウンドを再生
-  Future<void> _playSystemSound() async {
-    try {
-      await SystemSound.play(SystemSoundType.click);
-    } catch (e) {
-      debugLog('ImprovedAudioService: システムサウンドエラー: $e');
-    }
-  }
-
-  // 精度モードの設定
-  void setPrecisionMode(PrecisionMode mode) {
-    if (_precisionMode == mode) return;
-
-    debugLog('ImprovedAudioService: 精度モードを変更: $mode');
-    _precisionMode = mode;
-
-    // モード変更時に再生中なら再起動
-    final wasPlaying = _isPlaying;
-    final currentTempo = _currentTempo;
-
-    if (wasPlaying) {
-      stopTempoCues();
-      startTempoCues(currentTempo);
-    }
-  }
-
-  // 周波数設定
-  void setFrequency(double frequency) {
-    if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-      try {
-        _nativeChannel.invokeMethod('setFrequency', {
-          'frequency': frequency,
-        });
-        debugLog('ImprovedAudioService: 周波数を設定: $frequency Hz');
-      } catch (e) {
-        debugLog('ImprovedAudioService: 周波数設定エラー: $e');
-      }
-    }
-  }
-
-  // クリック長さ設定
-  void setClickDuration(double duration) {
-    if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-      try {
-        _nativeChannel.invokeMethod('setDuration', {
-          'duration': duration,
-        });
-        debugLog('ImprovedAudioService: クリック長さを設定: $duration 秒');
-      } catch (e) {
-        debugLog('ImprovedAudioService: クリック長さ設定エラー: $e');
-      }
-    }
-  }
-
-  // 波形設定
-  void setWaveform(WaveformType waveform) {
-    if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-      try {
-        _nativeChannel.invokeMethod('setWaveform', {
-          'waveform': waveform.index,
-        });
-        debugLog('ImprovedAudioService: 波形を設定: $waveform');
-      } catch (e) {
-        debugLog('ImprovedAudioService: 波形設定エラー: $e');
-      }
-    }
-  }
-
-  // テンポに合わせた再生開始 - 改良版
-  void startTempoCues(double bpm) {
-    debugLog('ImprovedAudioService: テンポキュー開始: $bpm BPM, モード: $_precisionMode');
-
-    // 既存の再生を停止
-    stopTempoCues();
-
-    // BPMが無効な場合
-    if (bpm <= 0) {
-      debugLog('ImprovedAudioService: 無効なBPM値: $bpm');
-      return;
-    }
-
-    // エラー状態のチェック
-    if (_hasError) {
-      debugLog(
-          'ImprovedAudioService: エラーが発生しているため、テンポキューを開始できません: $_lastErrorMessage');
-      // エラー状態をリセットして続行を試みる
-      _resetError();
-    }
-
-    _isPlaying = true;
-    _currentTempo = bpm;
-    _missedBeeps = 0;
-    _totalBeeps = 0;
-    _avgBeepDelay = 0.0;
-    _scheduledBeeps.clear();
-
-    // プレビューモードの場合は軽量版を使用
-    if (_previewMode) {
-      debugLog('ImprovedAudioService: プレビューモードで再生を開始します');
-      _startPreviewModePlayback(bpm);
-      return;
-    }
-
-    try {
-      // ネイティブの高精度モードが利用可能な場合（iOS/Android）
-      if (_preloadedBufferAvailable &&
-          (Platform.isIOS || Platform.isAndroid) &&
-          _precisionMode == PrecisionMode.highPrecision) {
-        debugLog('ImprovedAudioService: ネイティブ高精度モードを使用します');
-        try {
-          _startNativeHighPrecisionPlayback(bpm);
-          return;
-        } catch (e) {
-          debugLog('ImprovedAudioService: ネイティブ高精度モード開始エラー: $e、フォールバックを使用します');
-          // ネイティブモードが失敗した場合、標準モードにフォールバック
-        }
-      }
-
-      // モードに応じた再生処理
-      switch (_precisionMode) {
-        case PrecisionMode.highPrecision:
-          debugLog('ImprovedAudioService: 高精度モードで再生を開始します');
-          _startHighPrecisionTempoPlayback(bpm);
-          break;
-        case PrecisionMode.synthesized:
-          debugLog('ImprovedAudioService: 合成モードで再生を開始します');
-          _startSynthesizedTempoPlayback(bpm);
-          break;
-        default:
-          debugLog('ImprovedAudioService: 基本モードで再生を開始します');
-          _startBasicTempoPlayback(bpm);
-      }
-    } catch (e) {
-      debugLog('ImprovedAudioService: テンポキュー開始エラー: $e');
-
-      // エラーが発生したら最も基本的なモードで再試行
-      try {
-        debugLog('ImprovedAudioService: 基本モードでのフォールバック再生を試みます');
-        _startBasicTempoPlayback(bpm);
-      } catch (fallbackError) {
-        debugLog('ImprovedAudioService: フォールバック再生も失敗: $fallbackError');
-        _isPlaying = false;
-      }
-    }
-  }
-
-  // ネイティブの高精度モードでの再生
-  void _startNativeHighPrecisionPlayback(double bpm) {
-    try {
-      _nativeChannel.invokeMethod('startStableMetronome', {
-        'bpm': bpm,
-        'soundType': _currentSoundType,
-        'volume': _volume,
-        'lookAheadMs': 200, // 先行スケジューリング
+      // All services ready
+      setState(() {
+        _servicesReady = true;
+        _isInitializing = false;
       });
 
-      debugLog('ImprovedAudioService: ネイティブメトロノームを開始しました: $bpm BPM');
+      debugLog('All services initialized');
 
-      // ビート通知のリスナー（UI同期用）
-      _nativeChannel.setMethodCallHandler((call) async {
-        if (call.method == 'onBeatPlayed') {
-          _lastActualBeepTime = DateTime.now();
-        }
-        return null;
+      // Check calibration status
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _checkCalibrationAndProceed();
       });
     } catch (e) {
-      debugLog('ImprovedAudioService: ネイティブ高精度モード起動エラー: $e');
-      throw e; // 上位ハンドラでフォールバック処理
-    }
-  }
-
-  // 軽量プレビューモードでの再生
-  void _startPreviewModePlayback(double bpm) {
-    // BPMからインターバル（ミリ秒）を計算
-    final interval = (60000 / bpm).round();
-
-    debugLog(
-        'ImprovedAudioService: プレビューモードでメトロノームを開始します: $bpm BPM (間隔: $interval ms)');
-
-    // 最初のクリックを再生
-    _playBeep();
-
-    // 軽量タイマーを使用（CPUの負荷を軽減）
-    _clickTimer = Timer.periodic(Duration(milliseconds: interval), (timer) {
-      if (!_isPlaying) {
-        timer.cancel();
-        return;
-      }
-
-      _playBeep();
-    });
-  }
-
-  // 基本モードでのテンポ再生（改良）
-  void _startBasicTempoPlayback(double bpm) {
-    // BPMからインターバル（ミリ秒）を計算
-    final interval = (60000 / bpm).round();
-
-    debugLog(
-        'ImprovedAudioService: 基本モードでメトロノームを開始します: $bpm BPM (間隔: $interval ms)');
-
-    // 最初のクリックを実行
-    _playBeep();
-
-    // 通常の周期的なタイマーよりも少し短い周期で実行し、安定性を向上
-    final timerInterval = max(1, interval ~/ 10);
-    int nextTickTime = DateTime.now().millisecondsSinceEpoch + interval;
-
-    _clickTimer =
-        Timer.periodic(Duration(milliseconds: timerInterval), (timer) {
-      if (!_isPlaying) {
-        timer.cancel();
-        return;
-      }
-
-      final now = DateTime.now().millisecondsSinceEpoch;
-      if (now >= nextTickTime) {
-        _playBeep(scheduledTime: nextTickTime);
-        nextTickTime = now + interval;
-      }
-    });
-  }
-
-  // 高精度モードでのテンポ再生
-  void _startHighPrecisionTempoPlayback(double bpm) {
-    // BPMからインターバル（ミリ秒）を計算
-    final intervalMs = (60000 / bpm);
-
-    debugLog(
-        'ImprovedAudioService: 高精度モードでメトロノームを開始します: $bpm BPM (間隔: $intervalMs ms)');
-
-    // 正確なタイミングを測定するストップウォッチを初期化
-    _stopwatch = Stopwatch()..start();
-    _nextTickTime = 0;
-    _tickCount = 0;
-
-    // 先行スケジューリング
-    final now = DateTime.now().millisecondsSinceEpoch;
-    _scheduleBeeps(now, intervalMs, _lookAheadMs);
-
-    // 最初のクリックを再生
-    _playBeep();
-
-    // スケジューラタイマーを開始
-    _schedulerTimer =
-        Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (!_isPlaying) {
-        timer.cancel();
-        return;
-      }
-
-      // スケジュールを更新
-      final currentTime = DateTime.now().millisecondsSinceEpoch;
-      _scheduleBeeps(currentTime, intervalMs, _lookAheadMs);
-    });
-
-    // 再生タイマーを開始（BPMに応じて最適化された間隔で監視）
-    int checkInterval = bpm > 120 ? 1 : (bpm > 60 ? 2 : 5);
-
-    _clickTimer =
-        Timer.periodic(Duration(milliseconds: checkInterval), (timer) {
-      if (!_isPlaying) {
-        timer.cancel();
-        _stopwatch?.stop();
-        return;
-      }
-
-      final now = DateTime.now().millisecondsSinceEpoch;
-
-      // ジッター防止のためのわずかな許容範囲（1-2ms）を持たせる
-      while (_scheduledBeeps.isNotEmpty && (now >= _scheduledBeeps[0] - 1)) {
-        final scheduledTime = _scheduledBeeps.removeAt(0);
-        _playBeep(scheduledTime: scheduledTime);
-      }
-    });
-  }
-
-  // ビープ音のスケジューリング
-  void _scheduleBeeps(int currentTime, double interval, int lookAheadMs) {
-    final lookAheadTime = currentTime + lookAheadMs;
-
-    // 既存のスケジュールにあるビープ音の最後の時間を取得
-    int lastScheduledTime = currentTime;
-    if (_scheduledBeeps.isNotEmpty) {
-      // ソートして最後の値を取得
-      _scheduledBeeps.sort();
-      lastScheduledTime = _scheduledBeeps.last;
-
-      // 重複を避けるため、現在時刻より前のスケジュールを削除
-      _scheduledBeeps.removeWhere((time) => time < currentTime);
-    }
-
-    // 次のビープ音の時間を計算（最後のスケジュールから次の間隔を加算）
-    var nextTime = lastScheduledTime + interval.round();
-
-    // 先行時間までのビープ音をスケジュール
-    while (nextTime <= lookAheadTime) {
-      if (!_scheduledBeeps.contains(nextTime)) {
-        _scheduledBeeps.add(nextTime);
-      }
-      nextTime += interval.round();
-    }
-  }
-
-  // シンセサイズドモードでのテンポ再生
-  void _startSynthesizedTempoPlayback(double bpm) {
-    // BPMからインターバル（ミリ秒）を計算
-    final interval = (60000 / bpm);
-
-    debugLog(
-        'ImprovedAudioService: 合成モードでメトロノームを開始します: $bpm BPM (間隔: $interval ms)');
-
-    // 現在の時間（ミリ秒）
-    final startTime = DateTime.now().millisecondsSinceEpoch;
-    var nextTickTime = startTime;
-
-    // 最初のクリックを再生
-    _playBeep();
-    nextTickTime += interval.round();
-
-    // より高精度なスケジューラ
-    _clickTimer = Timer.periodic(const Duration(milliseconds: 1), (timer) {
-      if (!_isPlaying) {
-        timer.cancel();
-        return;
-      }
-
-      final currentTime = DateTime.now().millisecondsSinceEpoch;
-
-      // 次のタイミングに達したか
-      if (currentTime >= nextTickTime) {
-        _playBeep(scheduledTime: nextTickTime);
-
-        // ドリフトを防ぐ改良アルゴリズム
-        final elapsedTime = currentTime - startTime;
-        final perfectBeats = elapsedTime / interval;
-        final nextBeat = (perfectBeats.floor() + 1);
-        nextTickTime = startTime + (nextBeat * interval).round();
-      }
-    });
-  }
-
-  // テンポの更新 - 改良版
-  void updateTempo(double bpm) {
-    if (!_isPlaying || _currentTempo == bpm) return;
-
-    debugLog(
-        'ImprovedAudioService: テンポを更新します: $bpm BPM (現在: $_currentTempo BPM)');
-
-    // 最小・最大値のチェック
-    if (bpm < 10 || bpm > 300) {
-      debugLog('ImprovedAudioService: 警告: 指定されたテンポ($bpm)が範囲外です。制限内に調整します。');
-      bpm = bpm.clamp(10, 300);
-    }
-
-    _currentTempo = bpm;
-
-    // ネイティブの高精度モードを使用中の場合
-    if (_preloadedBufferAvailable &&
-        (Platform.isIOS || Platform.isAndroid) &&
-        _precisionMode == PrecisionMode.highPrecision) {
-      try {
-        _nativeChannel.invokeMethod('updateTempo', {
-          'bpm': bpm,
-        });
-        debugLog('ImprovedAudioService: ネイティブモードでテンポを更新しました: $bpm BPM');
-        return;
-      } catch (e) {
-        debugLog('ImprovedAudioService: ネイティブテンポ更新エラー: $e');
-      }
-    }
-
-    // モードに基づいて再起動
-    debugLog('ImprovedAudioService: テンポ変更のためメトロノームを再起動します');
-    stopTempoCues();
-    startTempoCues(bpm);
-  }
-
-  // クリック音の停止 - 改良版
-  void stopTempoCues() {
-    if (!_isPlaying) return;
-
-    debugLog('ImprovedAudioService: テンポキューを停止します');
-
-    _isPlaying = false;
-
-    // ネイティブの高精度モードを使用中の場合
-    if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-      try {
-        _nativeChannel.invokeMethod('stopMetronome');
-        debugLog('ImprovedAudioService: ネイティブメトロノームを停止しました');
-      } catch (e) {
-        debugLog('ImprovedAudioService: ネイティブメトロノーム停止エラー: $e');
-      }
-    }
-
-    // タイマーの停止
-    _clickTimer?.cancel();
-    _clickTimer = null;
-
-    _schedulerTimer?.cancel();
-    _schedulerTimer = null;
-
-    // ストップウォッチの停止
-    _stopwatch?.stop();
-    _stopwatch = null;
-
-    // スケジュールされたビープをクリア
-    _scheduledBeeps.clear();
-
-    // 診断情報の出力
-    if (_totalBeeps > 0 && kDebugMode) {
-      final missRate = (_missedBeeps / _totalBeeps) * 100;
-      debugLog(
-          '診断サマリー: $_totalBeeps ビープのうち $_missedBeeps が遅延 (${missRate.toStringAsFixed(1)}%)');
-      debugLog('平均遅延: ${_avgBeepDelay.toStringAsFixed(2)}ms');
-    }
-  }
-
-  // 音量設定 - 改良版
-  void setVolume(double volume) {
-    volume = max(0.0, min(1.0, volume));
-
-    if (_volume != volume) {
-      debugLog('ImprovedAudioService: 音量を設定します: $volume (現在: $_volume)');
-      _volume = volume;
-
-      // ネイティブ側の音量も更新
-      if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-        try {
-          _nativeChannel.invokeMethod('setVolume', {
-            'volume': _volume,
-          });
-        } catch (e) {
-          debugLog('ImprovedAudioService: ネイティブ音量設定エラー: $e');
-        }
-      }
-    }
-  }
-
-  // 診断ツール実行
-  Future<Map<String, dynamic>> runDiagnostics() async {
-    debugLog('ImprovedAudioService: 診断ツールを実行します');
-
-    final results = <String, dynamic>{};
-
-    // テスト1: 基本タイミングテスト
-    results['basicTimingTest'] = await _runBasicTimingTest();
-
-    // テスト2: システム負荷テスト
-    results['systemLoadTest'] = await _runSystemLoadTest();
-
-    // テスト3: オーディオセッションチェック
-    results['audioSessionCheck'] = await _checkAudioSession();
-
-    return results;
-  }
-
-  Future<Map<String, dynamic>> _runBasicTimingTest() async {
-    final result = <String, dynamic>{};
-
-    try {
-      stopTempoCues(); // 進行中の再生を確実に停止
-
-      final testBpm = 120.0; // 1秒あたり2拍
-      final expectedInterval = 500; // ms
-      final testDuration = 5000; // 5秒
-      final beatTimestamps = <int>[];
-
-      // タイミング計測の設定
-      _testTimestampController = StreamController<int>.broadcast();
-      final subscription = _testTimestampController.stream.listen((timestamp) {
-        beatTimestamps.add(timestamp);
+      debugLog('Initialization error: $e');
+      setState(() {
+        _isInitializing = false;
+        _servicesReady = false;
+        _initError = e.toString();
       });
 
-      // 最も精度の高いモードでテストシーケンスを再生
-      setPrecisionMode(PrecisionMode.highPrecision);
-
-      _isInDiagnosticMode = true;
-
-      startTempoCues(testBpm);
-
-      // テスト時間待機
-      await Future.delayed(Duration(milliseconds: testDuration));
-
-      stopTempoCues();
-      _isInDiagnosticMode = false;
-
-      // タイミング統計の計算
-      final intervals = <int>[];
-      for (int i = 1; i < beatTimestamps.length; i++) {
-        intervals.add(beatTimestamps[i] - beatTimestamps[i - 1]);
-      }
-
-      if (intervals.isEmpty) {
-        result['status'] = 'failure';
-        result['error'] = 'ビートが検出されませんでした';
-        return result;
-      }
-
-      // 統計計算
-      final avgInterval = intervals.reduce((a, b) => a + b) / intervals.length;
-      final driftFromExpected = (avgInterval - expectedInterval).abs();
-
-      double sumSquaredDiffs = 0.0;
-      for (final interval in intervals) {
-        sumSquaredDiffs += pow(interval - avgInterval, 2);
-      }
-      final stdDev = sqrt(sumSquaredDiffs / intervals.length);
-
-      // クリーンアップ
-      await subscription.cancel();
-      await _testTimestampController.close();
-
-      // 統計を返す
-      result['status'] = 'success';
-      result['beatCount'] = beatTimestamps.length;
-      result['avgInterval'] = avgInterval;
-      result['stdDev'] = stdDev;
-      result['drift'] = driftFromExpected;
-      result['maxJitter'] = intervals.reduce((a, b) => a > b ? a : b) -
-          intervals.reduce((a, b) => a < b ? a : b);
-
-      // パフォーマンス評価
-      if (stdDev < 5) {
-        result['quality'] = 'excellent';
-      } else if (stdDev < 15) {
-        result['quality'] = 'good';
-      } else if (stdDev < 30) {
-        result['quality'] = 'acceptable';
-      } else {
-        result['quality'] = 'poor';
-      }
-    } catch (e) {
-      result['status'] = 'error';
-      result['error'] = e.toString();
-    }
-
-    return result;
-  }
-
-  Future<Map<String, dynamic>> _runSystemLoadTest() async {
-    // 実装の詳細は負荷下でのパフォーマンスをテスト
-    try {
-      if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-        final result = await _nativeChannel.invokeMethod('runSystemLoadTest');
-        return {
-          'status': 'success',
-          'nativeResult': result,
-          'message': 'システムは適切なオーディオ負荷を処理できます'
-        };
-      }
-      return {'status': 'success', 'message': 'システムはオーディオ負荷を処理できます'};
-    } catch (e) {
-      return {'status': 'error', 'error': e.toString()};
+      // Show error
+      _showError('Initialization Error', e.toString());
     }
   }
 
-  Future<Map<String, dynamic>> _checkAudioSession() async {
-    // 実装はオーディオセッション構成をチェック
-    try {
-      if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-        final result = await _nativeChannel.invokeMethod('checkAudioSession');
-        return {
-          'status': 'success',
-          'nativeResult': result,
-          'message': 'オーディオセッションは正しく構成されています'
-        };
-      }
-      return {'status': 'success', 'message': 'オーディオセッションは正しく構成されています'};
-    } catch (e) {
-      return {'status': 'error', 'error': e.toString()};
-    }
-  }
+  // Check calibration and start experiment
+  Future<void> _checkCalibrationAndProceed() async {
+    if (!_servicesReady) return;
 
-  // メトロノーム精度チェック（デバッグ用）
-  void checkTempoAccuracy(int seconds) {
-    if (_isPlaying) {
-      debugLog('ImprovedAudioService: 精度チェックは再生停止時に実行してください');
-      return;
-    }
+    debugLog('Checking calibration status');
 
-    debugLog('ImprovedAudioService: メトロノーム精度テスト開始 (${seconds}秒間)...');
-
-    final testTempo = 120.0; // 毎分120拍
-    final expectedInterval = 500; // 500ミリ秒ごと
-    int beepCount = 0;
-    final List<int> actualTimes = [];
-
-    // 精度テスト用の変数
-    _missedBeeps = 0;
-    _totalBeeps = 0;
-    _avgBeepDelay = 0.0;
-
-    // 最初のビープ音
-    _playBeep();
-    actualTimes.add(DateTime.now().millisecondsSinceEpoch);
-    beepCount++;
-
-    final endTime = DateTime.now().millisecondsSinceEpoch + (seconds * 1000);
-
-    // 高精度モードでテスト
-    _scheduledBeeps.clear();
-    final startTime = DateTime.now().millisecondsSinceEpoch;
-
-    // スケジュールを作成
-    for (int i = 1; i <= (seconds * 2); i++) {
-      _scheduledBeeps.add(startTime + (i * expectedInterval));
-    }
-
-    _clickTimer = Timer.periodic(const Duration(milliseconds: 1), (timer) {
-      final now = DateTime.now().millisecondsSinceEpoch;
-
-      if (now >= endTime) {
-        timer.cancel();
-        _analyzeAccuracyResults(actualTimes, expectedInterval);
-        return;
-      }
-
-      // スケジュールされたビープ音がある場合は再生
-      while (_scheduledBeeps.isNotEmpty && _scheduledBeeps[0] <= now) {
-        final scheduledTime = _scheduledBeeps.removeAt(0);
-        _playBeep(scheduledTime: scheduledTime);
-        actualTimes.add(now);
-        beepCount++;
-      }
-    });
-  }
-
-  // 精度テスト結果の分析（デバッグ用）
-  void _analyzeAccuracyResults(List<int> actualTimes, int expectedInterval) {
-    if (actualTimes.length < 2) {
-      debugLog('ImprovedAudioService: 十分なデータがありません');
-      return;
-    }
-
-    final List<int> intervals = [];
-    for (int i = 1; i < actualTimes.length; i++) {
-      intervals.add(actualTimes[i] - actualTimes[i - 1]);
-    }
-
-    final double avgInterval =
-        intervals.reduce((a, b) => a + b) / intervals.length;
-    double sumSquaredDiff = 0.0;
-    for (final interval in intervals) {
-      sumSquaredDiff += pow(interval - avgInterval, 2);
-    }
-    final double stdDev = sqrt(sumSquaredDiff / intervals.length);
-    final double errorRate =
-        ((avgInterval - expectedInterval) / expectedInterval) * 100;
-
-    debugLog('ImprovedAudioService: ===== 精度テスト結果 =====');
-    debugLog('ImprovedAudioService: 予定間隔: ${expectedInterval}ms');
-    debugLog(
-        'ImprovedAudioService: 実際の平均間隔: ${avgInterval.toStringAsFixed(2)}ms');
-    debugLog('ImprovedAudioService: 標準偏差: ${stdDev.toStringAsFixed(2)}ms');
-    debugLog('ImprovedAudioService: 誤差率: ${errorRate.toStringAsFixed(2)}%');
-    debugLog('ImprovedAudioService: ビープ音の総数: ${actualTimes.length}');
-
-    if (stdDev < 10) {
-      debugLog('ImprovedAudioService: 精度評価: 優れています (標準偏差 < 10ms)');
-    } else if (stdDev < 20) {
-      debugLog('ImprovedAudioService: 精度評価: 良好です (標準偏差 < 20ms)');
-    } else if (stdDev < 30) {
-      debugLog('ImprovedAudioService: 精度評価: 許容範囲内です (標準偏差 < 30ms)');
+    // Check calibration points
+    if (_sensorService.calibrationPoints.isEmpty) {
+      debugLog('Calibration not performed');
+      // Show dialog for calibration
+      _showCalibrationDialog();
     } else {
-      debugLog('ImprovedAudioService: 精度評価: 改善が必要です (標準偏差 > 30ms)');
+      debugLog(
+          'Calibration already completed: ${_sensorService.calibrationPoints.length} points');
+      // Start experiment
+      _startExperiment();
     }
   }
 
-  // エラー状態をリセットして復旧を試みる
-  Future<bool> recover() async {
-    debugLog('ImprovedAudioService: 復旧処理を開始します');
+  // Show calibration dialog
+  void _showCalibrationDialog() {
+    debugLog('Showing calibration dialog');
 
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        title: const Text('Calibration Required'),
+        content: const Text(
+            'For accurate measurements, sensor calibration is needed. '
+            'Calibration allows for more precise walking rhythm measurement.'),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              // Continue without calibration (reduced accuracy)
+              debugLog('Skipping calibration');
+              _startExperiment();
+            },
+            child: const Text('Skip'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+              _navigateToCalibration();
+            },
+            child: const Text('Perform Calibration'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Navigate to calibration screen
+  Future<void> _navigateToCalibration() async {
+    debugLog('Navigating to calibration screen');
+
+    // Navigate to calibration screen
+    final result = await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (context) => const CalibrationScreen(),
+      ),
+    );
+
+    debugLog('Returned from calibration screen: $result');
+
+    // Start experiment after calibration
+    _startExperiment();
+  }
+
+  // Start experiment
+  Future<void> _startExperiment() async {
+    debugLog('Starting experiment');
+
+    final settings = Provider.of<ExperimentSettings>(context, listen: false);
+
+    // Create experiment session
+    _sessionId = await _experimentService.startExperimentSession(settings);
+    debugLog('Created experiment session: session ID = $_sessionId');
+
+    // Subscribe to sensor data
+    _gaitRhythmSubscription = _sensorService.gaitRhythmStream.listen((bpm) {
+      setState(() {
+        _currentBpm = bpm;
+      });
+
+      // Record experiment data
+      _experimentService.addGaitRhythmData(
+        bpm,
+        settings.currentPhase,
+        _targetBpm,
+      );
+    });
+    debugLog('Subscribed to gait rhythm data');
+
+    // Subscribe to experiment data
+    _gaitDataSubscription = _experimentService.gaitDataStream.listen((data) {
+      setState(() {
+        // Add data point for graph
+        _rhythmDataPoints.add(FlSpot(
+          _rhythmDataPoints.length.toDouble(),
+          data.bpm,
+        ));
+
+        // Remove old data points if exceeding max
+        if (_rhythmDataPoints.length > _maxDataPoints) {
+          _rhythmDataPoints.removeAt(0);
+
+          // Adjust X values
+          for (var i = 0; i < _rhythmDataPoints.length; i++) {
+            _rhythmDataPoints[i] = FlSpot(i.toDouble(), _rhythmDataPoints[i].y);
+          }
+        }
+      });
+    });
+    debugLog('Subscribed to experiment data');
+
+    // Start sensor
+    _sensorService.startSensing();
+    debugLog('Started sensor');
+
+    // Start from calibration
+    settings.startExperiment();
+    _processPhaseChange(settings);
+    debugLog('Started experiment: phase = ${settings.currentPhase}');
+  }
+
+  // Process phase change
+  void _processPhaseChange(ExperimentSettings settings) {
+    debugLog('Phase changed: ${settings.currentPhase}');
+
+    // Process based on current phase
+    switch (settings.currentPhase) {
+      case ExperimentPhase.calibration:
+        _startCalibrationPhase(settings);
+        break;
+      case ExperimentPhase.silentWalking:
+        _startSilentWalkingPhase(settings);
+        break;
+      case ExperimentPhase.syncWithNaturalTempo:
+        _startSyncPhase(settings);
+        break;
+      case ExperimentPhase.rhythmGuidance1:
+        _startGuidance1Phase(settings);
+        break;
+      case ExperimentPhase.rhythmGuidance2:
+        _startGuidance2Phase(settings);
+        break;
+      case ExperimentPhase.cooldown:
+        _startCooldownPhase(settings);
+        break;
+      case ExperimentPhase.completed:
+        _completeExperiment();
+        break;
+      default:
+        break;
+    }
+  }
+
+  // Calibration phase
+  void _startCalibrationPhase(ExperimentSettings settings) {
+    debugLog('Starting calibration phase');
+
+    _targetBpm = 0.0;
+    _audioService.stopTempoCues();
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.calibration,
+      settings,
+      () {
+        // When phase completes: move to silent walking phase
+        settings.setPhase(ExperimentPhase.silentWalking);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Silent walking phase
+  void _startSilentWalkingPhase(ExperimentSettings settings) {
+    debugLog('Starting silent walking phase');
+
+    _targetBpm = 0.0;
+    _audioService.stopTempoCues();
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.silentWalking,
+      settings,
+      () {
+        // When phase completes: set natural walking rhythm
+        final naturalTempo = _currentBpm;
+        settings.setNaturalTempo(naturalTempo);
+        debugLog('Set natural walking rhythm: $naturalTempo BPM');
+
+        // Move to sync phase
+        settings.setPhase(ExperimentPhase.syncWithNaturalTempo);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Sync phase
+  void _startSyncPhase(ExperimentSettings settings) {
+    debugLog('Starting sync phase');
+
+    _targetBpm = settings.naturalTempo ?? 100.0;
+    debugLog('Set target tempo: $_targetBpm BPM');
+
+    _audioService.setVolume(settings.volume);
+
+    // Set high precision mode
+    _audioService.setPrecisionMode(PrecisionMode.highPrecision);
+    debugLog('Set audio service to high precision mode');
+
+    // Load and play sound
+    _loadAndStartMetronome(settings.clickSoundType, _targetBpm);
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.syncWithNaturalTempo,
+      settings,
+      () {
+        // When phase completes: move to guidance phase 1
+        settings.setPhase(ExperimentPhase.rhythmGuidance1);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Load and start metronome
+  Future<void> _loadAndStartMetronome(
+      String soundType, double targetBpm) async {
     try {
-      stopTempoCues();
+      // Explicitly load click sound
+      debugLog('Loading click sound "$soundType"');
+      bool soundLoaded = await _audioService.loadClickSound(soundType);
+      if (!soundLoaded) {
+        debugLog('Failed to load click sound');
+        _showError('Sound Error', 'Failed to load click sound');
+        return;
+      }
 
-      // 初期化状態をリセット
-      _isInitialized = false;
+      debugLog('Successfully loaded click sound');
 
-      // 再初期化
-      return await initialize();
+      // Start metronome
+      _audioService.startTempoCues(targetBpm);
+      debugLog('Started metronome: BPM = $targetBpm');
     } catch (e) {
-      debugLog('ImprovedAudioService: 復旧中のエラー: $e');
-      return false;
+      debugLog('Metronome start error: $e');
+      _showError('Metronome Error', 'Failed to start metronome: $e');
     }
   }
 
-  // リソース解放
+  // Guidance phase 1
+  void _startGuidance1Phase(ExperimentSettings settings) {
+    debugLog('Starting guidance phase 1');
+
+    _targetBpm = (settings.naturalTempo ?? 100.0) + settings.tempoIncrement;
+    debugLog('Updated target tempo: $_targetBpm BPM');
+
+    _audioService.updateTempo(_targetBpm);
+    debugLog('Updated metronome tempo: $_targetBpm BPM');
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.rhythmGuidance1,
+      settings,
+      () {
+        // When phase completes: move to guidance phase 2
+        settings.setPhase(ExperimentPhase.rhythmGuidance2);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Guidance phase 2
+  void _startGuidance2Phase(ExperimentSettings settings) {
+    debugLog('Starting guidance phase 2');
+
+    _targetBpm =
+        (settings.naturalTempo ?? 100.0) + (settings.tempoIncrement * 2);
+    debugLog('Updated target tempo: $_targetBpm BPM');
+
+    _audioService.updateTempo(_targetBpm);
+    debugLog('Updated metronome tempo: $_targetBpm BPM');
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.rhythmGuidance2,
+      settings,
+      () {
+        // When phase completes: move to cooldown phase
+        settings.setPhase(ExperimentPhase.cooldown);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Cooldown phase
+  void _startCooldownPhase(ExperimentSettings settings) {
+    debugLog('Starting cooldown phase');
+
+    _targetBpm = settings.naturalTempo ?? 100.0;
+    debugLog('Updated target tempo: $_targetBpm BPM');
+
+    _audioService.updateTempo(_targetBpm);
+    debugLog('Updated metronome tempo: $_targetBpm BPM');
+
+    // Start phase
+    _experimentService.startPhase(
+      ExperimentPhase.cooldown,
+      settings,
+      () {
+        // When phase completes: complete experiment
+        settings.setPhase(ExperimentPhase.completed);
+        _processPhaseChange(settings);
+      },
+    );
+  }
+
+  // Complete experiment
+  void _completeExperiment() async {
+    debugLog('Completing experiment');
+
+    // Stop audio
+    _audioService.stopTempoCues();
+    debugLog('Stopped audio');
+
+    // Stop sensor
+    _sensorService.stopSensing();
+    debugLog('Stopped sensor');
+
+    // Complete experiment session
+    await _experimentService.completeExperimentSession();
+    debugLog('Completed experiment session');
+
+    // Navigate to results screen
+    if (!mounted) return;
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (context) => ResultsScreen(sessionId: _sessionId!),
+      ),
+    );
+    debugLog('Navigating to results screen: session ID = $_sessionId');
+  }
+
+  @override
   void dispose() {
-    debugLog('ImprovedAudioService: リソースを解放します');
+    debugLog('Disposing experiment screen resources');
 
-    stopTempoCues();
+    // Cancel subscriptions
+    _gaitRhythmSubscription?.cancel();
+    _gaitDataSubscription?.cancel();
+    debugLog('Cancelled subscriptions');
 
-    // ネイティブリソースの解放
-    if (_preloadedBufferAvailable && (Platform.isIOS || Platform.isAndroid)) {
-      try {
-        _nativeChannel.invokeMethod('releaseResources');
-      } catch (e) {
-        debugLog('ImprovedAudioService: ネイティブリソース解放エラー: $e');
+    // Cancel phase timer
+    _experimentService.cancelCurrentPhase();
+    debugLog('Cancelled phase timer');
+
+    // Stop audio
+    if (_audioService.isPlaying) {
+      _audioService.stopTempoCues();
+      debugLog('Stopped audio');
+    }
+
+    super.dispose();
+  }
+
+  // Show error
+  void _showError(String title, String message) {
+    debugLog('Showing error: $title - $message');
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('$title: $message'),
+        backgroundColor: Colors.red,
+        duration: const Duration(seconds: 5),
+        action: SnackBarAction(
+          label: 'Close',
+          onPressed: () {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+          },
+        ),
+      ),
+    );
+  }
+
+  // Loading screen display
+  Widget _buildLoadingScreen() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const CircularProgressIndicator(),
+          const SizedBox(height: 20),
+          const Text('Preparing experiment...', style: TextStyle(fontSize: 18)),
+          if (_initError.isNotEmpty) ...[
+            const SizedBox(height: 20),
+            Text(
+              'Error: $_initError',
+              style: const TextStyle(color: Colors.red),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton(
+              onPressed: _initializeServices,
+              child: const Text('Retry'),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // Phase display section
+  Widget _buildPhaseDisplay(ExperimentSettings settings) {
+    final phaseText = _getPhaseDisplayText(settings.currentPhase);
+    final phaseIcon = _getPhaseIcon(settings.currentPhase);
+    final phaseColor = _getPhaseColor(settings.currentPhase);
+
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: phaseColor.withOpacity(0.5), width: 2),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(phaseIcon, color: phaseColor, size: 28),
+                const SizedBox(width: 10),
+                Text(
+                  'Current Phase: $phaseText',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: phaseColor,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            PhaseTimer(
+              phase: settings.currentPhase,
+              settings: settings,
+            ),
+            if (settings.currentPhase != ExperimentPhase.idle &&
+                settings.currentPhase != ExperimentPhase.completed)
+              Padding(
+                padding: const EdgeInsets.only(top: 8.0),
+                child: Text(
+                  _getPhaseInstructions(settings.currentPhase),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontStyle: FontStyle.italic,
+                    color: Colors.grey[700],
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Rhythm display section
+  Widget _buildRhythmDisplay(
+      double currentBpm, double targetBpm, ExperimentSettings settings) {
+    final bool showTarget =
+        settings.currentPhase != ExperimentPhase.silentWalking &&
+            settings.currentPhase != ExperimentPhase.calibration &&
+            targetBpm > 0;
+
+    final double diff = showTarget ? currentBpm - targetBpm : 0.0;
+    final bool isInSync = showTarget && diff.abs() < 3.0;
+
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Text(
+              'Rhythm Information',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+              children: [
+                // Current rhythm
+                TempoDisplay(
+                  title: 'Current Walking Rhythm',
+                  tempo: currentBpm,
+                  color: Colors.blue,
+                ),
+
+                // Target tempo (not in silent mode)
+                if (showTarget)
+                  TempoDisplay(
+                    title: 'Target Tempo',
+                    tempo: targetBpm,
+                    color: Colors.green,
+                  ),
+              ],
+            ),
+
+            // Sync status display
+            if (showTarget)
+              Padding(
+                padding: const EdgeInsets.only(top: 16.0),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      isInSync ? Icons.check_circle : Icons.info,
+                      color: isInSync ? Colors.green : Colors.orange,
+                      size: 20,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      isInSync
+                          ? 'Rhythm is synchronized'
+                          : (diff > 0
+                              ? '${diff.abs().toStringAsFixed(1)} BPM faster than target'
+                              : '${diff.abs().toStringAsFixed(1)} BPM slower than target'),
+                      style: TextStyle(
+                        color: isInSync ? Colors.green : Colors.orange,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Rhythm graph display
+  Widget _buildRhythmGraph(
+      List<FlSpot> dataPoints, double targetBpm, ExperimentSettings settings) {
+    final bool showTarget =
+        settings.currentPhase != ExperimentPhase.silentWalking &&
+            settings.currentPhase != ExperimentPhase.calibration &&
+            targetBpm > 0;
+
+    // If data is empty, show loading display
+    if (dataPoints.isEmpty) {
+      return Card(
+        elevation: 4,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: Container(
+          height: 300,
+          padding: const EdgeInsets.all(16.0),
+          child: const Center(
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 16),
+                Text('Collecting data...'),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    // Calculate Y-axis min and max values
+    final double minY =
+        (dataPoints.map((p) => p.y).reduce((a, b) => a < b ? a : b) - 10)
+            .clamp(0, double.infinity);
+    final double maxY =
+        dataPoints.map((p) => p.y).reduce((a, b) => a > b ? a : b) + 10;
+
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.show_chart, size: 20),
+                const SizedBox(width: 8),
+                Text(
+                  'Walking Rhythm Trend',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              height: 250,
+              child: LineChart(
+                LineChartData(
+                  gridData: FlGridData(
+                    show: true,
+                    drawVerticalLine: true,
+                    horizontalInterval: 20,
+                    getDrawingHorizontalLine: (value) {
+                      return FlLine(
+                        color: Colors.grey.withOpacity(0.3),
+                        strokeWidth: 1,
+                      );
+                    },
+                    getDrawingVerticalLine: (value) {
+                      return FlLine(
+                        color: Colors.grey.withOpacity(0.3),
+                        strokeWidth: 1,
+                      );
+                    },
+                  ),
+                  titlesData: FlTitlesData(
+                    leftTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: true,
+                        interval: 20,
+                        reservedSize: 40,
+                        getTitlesWidget: (value, meta) {
+                          return Text(
+                            value.toInt().toString(),
+                            style: const TextStyle(
+                              color: Colors.grey,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    bottomTitles: AxisTitles(
+                      sideTitles: SideTitles(
+                        showTitles: false,
+                      ),
+                    ),
+                    rightTitles: AxisTitles(
+                      sideTitles: SideTitles(showTitles: false),
+                    ),
+                    topTitles: AxisTitles(
+                      sideTitles: SideTitles(showTitles: false),
+                    ),
+                  ),
+                  borderData: FlBorderData(
+                    show: true,
+                    border: Border.all(color: Colors.grey.withOpacity(0.5)),
+                  ),
+                  minX: 0,
+                  maxX: dataPoints.length.toDouble() - 1,
+                  minY: minY,
+                  maxY: maxY,
+                  lineBarsData: [
+                    // Actual walking rhythm
+                    LineChartBarData(
+                      spots: dataPoints,
+                      isCurved: true,
+                      color: Colors.blue,
+                      barWidth: 3,
+                      dotData: FlDotData(show: false),
+                      belowBarData: BarAreaData(
+                        show: true,
+                        color: Colors.blue.withOpacity(0.1),
+                      ),
+                    ),
+                    // Target tempo
+                    if (showTarget)
+                      LineChartBarData(
+                        spots: [
+                          FlSpot(0, targetBpm),
+                          FlSpot(dataPoints.length.toDouble() - 1, targetBpm),
+                        ],
+                        isCurved: false,
+                        color: Colors.green.withOpacity(0.7),
+                        barWidth: 2,
+                        dotData: FlDotData(show: false),
+                        belowBarData: BarAreaData(show: false),
+                        dashArray: [5, 5],
+                      ),
+                  ],
+                  lineTouchData: LineTouchData(
+                    touchTooltipData: LineTouchTooltipData(
+                      tooltipBgColor: Colors.blueGrey.withOpacity(0.8),
+                      getTooltipItems: (List<LineBarSpot> touchedSpots) {
+                        return touchedSpots.map((barSpot) {
+                          final flSpot = barSpot;
+                          return LineTooltipItem(
+                            '${flSpot.y.toStringAsFixed(1)} BPM',
+                            const TextStyle(color: Colors.white),
+                          );
+                        }).toList();
+                      },
+                    ),
+                    handleBuiltInTouches: true,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildLegendItem('Walking Rhythm', Colors.blue),
+                const SizedBox(width: 16),
+                if (showTarget) _buildLegendItem('Target Tempo', Colors.green),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // Legend item builder
+  Widget _buildLegendItem(String label, Color color) {
+    return Row(
+      children: [
+        Container(
+          width: 16,
+          height: 3,
+          color: color,
+        ),
+        const SizedBox(width: 4),
+        Text(
+          label,
+          style: const TextStyle(fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  // Experiment abort confirmation dialog
+  Future<void> _confirmAbortExperiment() async {
+    debugLog('Showing experiment abort confirmation dialog');
+
+    final shouldAbort = await showDialog<bool>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Text('Abort Experiment'),
+            content: const Text(
+                'Are you sure you want to abort the experiment?\n\nData collected so far will still be saved.'),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: const Text('Cancel'),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red,
+                  foregroundColor: Colors.white,
+                ),
+                child: const Text('Abort'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (shouldAbort) {
+      debugLog('Aborting experiment');
+
+      // Stop audio
+      _audioService.stopTempoCues();
+      debugLog('Stopped audio');
+
+      // Stop sensor
+      _sensorService.stopSensing();
+      debugLog('Stopped sensor');
+
+      // Complete experiment session
+      if (_sessionId != null) {
+        await _experimentService.completeExperimentSession();
+        debugLog('Completed experiment session: session ID = $_sessionId');
       }
+
+      // Return to home screen
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      debugLog('Returning to home screen');
+    } else {
+      debugLog('Cancelled experiment abort');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final settings = Provider.of<ExperimentSettings>(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Walking Rhythm Experiment'),
+        centerTitle: true,
+        automaticallyImplyLeading: false,
+        actions: [
+          // Calibration button
+          IconButton(
+            icon: const Icon(Icons.tune),
+            tooltip: 'Sensor Calibration',
+            onPressed: () {
+              debugLog('Calibration button tapped');
+              _navigateToCalibration();
+            },
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: _isInitializing
+            ? _buildLoadingScreen()
+            : Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Phase display
+                    _buildPhaseDisplay(settings),
+
+                    const SizedBox(height: 16),
+
+                    // Rhythm display
+                    _buildRhythmDisplay(_currentBpm, _targetBpm, settings),
+
+                    const SizedBox(height: 16),
+
+                    // Graph display
+                    Expanded(
+                      child: _buildRhythmGraph(
+                          _rhythmDataPoints, _targetBpm, settings),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // Abort experiment button
+                    Align(
+                      alignment: Alignment.center,
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.stop),
+                        label: const Text('Abort Experiment'),
+                        onPressed: _confirmAbortExperiment,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 24, vertical: 12),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+      ),
+    );
+  }
+
+  // Phase display text
+  String _getPhaseDisplayText(ExperimentPhase phase) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return 'Calibration';
+      case ExperimentPhase.silentWalking:
+        return 'Silent Walking';
+      case ExperimentPhase.syncWithNaturalTempo:
+        return 'Sync with Natural Rhythm';
+      case ExperimentPhase.rhythmGuidance1:
+        return 'Rhythm Guidance 1';
+      case ExperimentPhase.rhythmGuidance2:
+        return 'Rhythm Guidance 2';
+      case ExperimentPhase.cooldown:
+        return 'Cooldown';
+      case ExperimentPhase.completed:
+        return 'Experiment Completed';
+      default:
+        return 'Preparing';
+    }
+  }
+
+  // Get icon for each phase
+  IconData _getPhaseIcon(ExperimentPhase phase) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return Icons.tune;
+      case ExperimentPhase.silentWalking:
+        return Icons.volume_off;
+      case ExperimentPhase.syncWithNaturalTempo:
+        return Icons.sync;
+      case ExperimentPhase.rhythmGuidance1:
+        return Icons.trending_up;
+      case ExperimentPhase.rhythmGuidance2:
+        return Icons.trending_up;
+      case ExperimentPhase.cooldown:
+        return Icons.arrow_downward;
+      case ExperimentPhase.completed:
+        return Icons.check_circle;
+      default:
+        return Icons.hourglass_empty;
+    }
+  }
+
+  // Get color for each phase
+  Color _getPhaseColor(ExperimentPhase phase) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return Colors.blue;
+      case ExperimentPhase.silentWalking:
+        return Colors.purple;
+      case ExperimentPhase.syncWithNaturalTempo:
+        return Colors.green;
+      case ExperimentPhase.rhythmGuidance1:
+        return Colors.orange;
+      case ExperimentPhase.rhythmGuidance2:
+        return Colors.deepOrange;
+      case ExperimentPhase.cooldown:
+        return Colors.teal;
+      case ExperimentPhase.completed:
+        return Colors.green;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  // Get instructions text for each phase
+  String _getPhaseInstructions(ExperimentPhase phase) {
+    switch (phase) {
+      case ExperimentPhase.calibration:
+        return 'Calibrating the sensor. Please walk naturally.';
+      case ExperimentPhase.silentWalking:
+        return 'Please walk naturally in silence. We are measuring your natural walking rhythm.';
+      case ExperimentPhase.syncWithNaturalTempo:
+        return 'Please try to walk in sync with the sound. This is your natural walking rhythm.';
+      case ExperimentPhase.rhythmGuidance1:
+        return 'Please try to walk in sync with the sound. The tempo has slightly increased.';
+      case ExperimentPhase.rhythmGuidance2:
+        return 'Please try to walk in sync with the sound. The tempo has further increased.';
+      case ExperimentPhase.cooldown:
+        return 'Returning to natural rhythm. Please relax and walk comfortably.';
+      default:
+        return '';
     }
   }
 }
